@@ -1,5 +1,7 @@
 # SECAMP: Skill-Conditioned Adversarial Motion Priors for Quadruped Locomotion
 
+> Isaac Lab 迁移版位于 [`isaaclab/`](isaaclab/README.md)。旧 Isaac Gym 实现保留用于结果对照；新训练、回放和策略导出请从该目录启动。
+
 **SECAMP** is a multi-skill locomotion framework for quadruped robots that combines Adversarial Motion Priors (AMP) with skill-conditioned policy learning. A single policy learns to switch between natural gaits — **trot**, **pace**, and **canter** — while tracking waypoint-based navigation commands, all without hand-crafted reward shaping.
 
 Trained entirely in [IsaacGym](https://developer.nvidia.com/isaac-gym) on the **Unitree Go2** robot, the framework supports sim-to-sim transfer to MuJoCo and direct sim-to-real deployment.

@@ -1,0 +1,14 @@
+[package]
+version = "0.1.0"
+title = "Go2 AMP Isaac Lab"
+description = "Direct-workflow Go2 AMP, SECAMP, and rough-terrain tasks"
+category = "robotics"
+keywords = ["isaaclab", "go2", "amp", "locomotion"]
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_assets" = {}
+
+[[python.module]]
+name = "go2_amp_isaaclab"
+

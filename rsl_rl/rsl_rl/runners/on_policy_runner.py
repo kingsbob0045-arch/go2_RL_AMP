@@ -219,7 +219,9 @@ class OnPolicyRunner:
             }, path)
 
     def load(self, path, load_optimizer=True):
-        loaded_dict = torch.load(path)
+        # Project checkpoints contain custom normalizer objects.  They are local/trusted artifacts,
+        # so opt out of PyTorch 2.6's restrictive weights-only default.
+        loaded_dict = torch.load(path, weights_only=False)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])

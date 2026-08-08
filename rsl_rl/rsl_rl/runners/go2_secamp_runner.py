@@ -5,7 +5,10 @@ import statistics
 
 from torch.utils.tensorboard import SummaryWriter
 import torch
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from rsl_rl.algorithms.secamp_ppo import SECAMPPPO
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
@@ -132,6 +135,8 @@ class Go2SECAMPRunner:
         if self.log_dir is not None and self.writer is None:
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             if self.cfg["wandb_enable"]:
+                if wandb is None:
+                    raise ImportError("wandb_enable=True but wandb is not installed")
                 self.wandb_run = wandb.init(
                     project=self.cfg.get("experiment_name", "legged_gym"),
                     name=self.cfg.get("run_name", None),
@@ -401,7 +406,9 @@ class Go2SECAMPRunner:
         }, path)
 
     def load(self, path, load_optimizer=True):
-        loaded_dict = torch.load(path)
+        # Project checkpoints contain custom normalizer objects.  They are local/trusted artifacts,
+        # so opt out of PyTorch 2.6's restrictive weights-only default.
+        loaded_dict = torch.load(path, weights_only=False)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
 
         disc_state = loaded_dict['discriminator_state_dict']

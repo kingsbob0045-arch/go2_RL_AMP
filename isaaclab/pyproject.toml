@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "go2-amp-isaaclab"
+version = "0.1.0"
+description = "Isaac Lab migration of the Go2 AMP/SECAMP project"
+requires-python = ">=3.10"
+dependencies = ["gymnasium", "torch"]
+
+[tool.ruff]
+line-length = 120
+
