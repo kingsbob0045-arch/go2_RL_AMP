@@ -1,0 +1,76 @@
+# -----------------------------------------------------------------------
+# Sim2Sim deployment config for motion prior standalone test
+# Prior input:  42-dim single-step obs  +  3-dim skill one-hot  =  45-dim
+# Prior output: 12 joint actions (directly, no residual)
+# -----------------------------------------------------------------------
+
+# --- Paths --------------------------------------------------------------
+# motion_prior_path: "{LEGGED_GYM_ROOT_DIR}/pretrained/[pos]+[lsgan]+[h2]+[project].pt"
+motion_prior_path: "{LEGGED_GYM_ROOT_DIR}/pretrained/[pd50_10]+[12200].pt"
+xml_path: "{LEGGED_GYM_ROOT_DIR}/resources/robots/go2/scene_flat.xml"
+
+# --- Simulation ---------------------------------------------------------
+simulation_duration: 99999.0
+simulation_dt: 0.005        # [s]  must match Isaac Gym sim.dt
+control_decimation: 4       # prior runs at 50 Hz
+
+# --- PD gains -----------------------------------------------------------
+kps: [50., 50., 50., 50., 50., 50., 50., 50., 50., 50., 50., 50.]
+kds: [ 1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.]
+# kps: [30., 30., 30., 30., 30., 30., 30., 30., 30., 30., 30., 30.]
+# kds: [ 0.7,  0.7,  0.7,  0.7,  0.7,  0.7,  0.7,  0.7,  0.7,  0.7,  0.7,  0.7]
+
+# --- Default joint angles [rad]  (Isaac Gym URDF order) ----------------
+# FL_hip, FL_thigh, FL_calf,  FR_hip, FR_thigh, FR_calf,
+# RL_hip, RL_thigh, RL_calf,  RR_hip, RR_thigh, RR_calf
+default_angles: [ 0.1,  0.8, -1.5,
+                 -0.1,  0.8, -1.5,
+                  0.1,  1.0, -1.5,
+                 -0.1,  1.0, -1.5]
+
+# --- Observation scales (match posTracking training) --------------------
+# Note: prior obs does NOT include lin_vel / ang_vel (those are critic-only)
+dof_pos_scale: 1.0     # obs_scales.dof_pos
+dof_vel_scale: 0.05    # obs_scales.dof_vel
+
+# commands slot: [dx_body * 0.5,  dy_body * 0.5,  0.0]
+# cmd_dir_scale = 0.5 (applied to the unit direction vector)
+cmd_dir_scale: 0.5
+
+# --- Action scale -------------------------------------------------------
+action_scale: 0.25     # control.action_scale
+
+# --- Dimensions ---------------------------------------------------------
+num_obs: 45     # 42 single-step + 3 skill
+num_dof: 12
+
+# --- Command: walking direction in body frame ---------------------------
+# cmd_direction_deg: 0 = forward (+X), 90 = left (+Y), -90 = right (-Y)
+# The prior sees [cos(deg)*0.5, sin(deg)*0.5, 0.0] in obs[3:6].
+cmd_direction_deg: 0.0
+
+# --- Skill command (one-hot): 0=pace, 1=trot, 2=canter ------------------
+# Used as initial skill; joystick buttons override at runtime.
+skill: 1   # trot
+
+# --- Joystick (gamepad) command interface --------------------------------
+# Left stick controls walking direction in body frame.
+# Face buttons switch skill on press (edge-triggered, not hold).
+#
+# Default button mapping (PS4 / generic gamepad via SDL2):
+#   btn 0 = Cross  / A   →  pace
+#   btn 1 = Circle / B   →  trot
+#   btn 2 = Square / X   →  canter
+# Adjust indices for your controller if needed.
+joystick:
+  enabled: true
+  axis_dir_x:  1       # left stick Y  → body-frame forward direction
+  axis_dir_y:  0       # left stick X  → body-frame lateral direction
+  sign_dir_x: -1       # invert: push up (axis=-1) → positive dx
+  sign_dir_y: -1       # invert: push left (axis=-1) → positive dy (+Y = left)
+  deadzone:    0.15    # larger deadzone for direction: avoids drift
+  btn_pace:    0
+  btn_trot:    1
+  btn_canter:  2
+  btn_lb:      4       # LB — dead-man's switch (hold LB+RB to enable motion)
+  btn_rb:      5       # RB — dead-man's switch

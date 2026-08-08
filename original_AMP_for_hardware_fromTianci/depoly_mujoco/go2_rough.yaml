@@ -1,0 +1,72 @@
+# -----------------------------------------------------------------------
+# Sim2Sim deployment config for go2_rough (residual policy + motion prior)
+# -----------------------------------------------------------------------
+
+# --- Paths --------------------------------------------------------------
+# Actor policy exported from play_go2_rough.py (EXPORT_POLICY=True)
+policy_path: "{LEGGED_GYM_ROOT_DIR}/logs/go2_rough/exported/policies/policy_1.pt"
+# Frozen motion prior (posTracking AMP prior)
+motion_prior_path: "{LEGGED_GYM_ROOT_DIR}/pretrained/[pos]+[lsgan]+[h2]+[project].pt"
+# MuJoCo XML — convert URDF or download from unitreerobotics/unitree_mujoco
+xml_path: "{LEGGED_GYM_ROOT_DIR}/resources/robots/go2/scene_terrain.xml"
+
+# --- Simulation ---------------------------------------------------------
+simulation_duration: 60.0   # [s]
+simulation_dt: 0.005         # [s]  must match Isaac Gym sim.dt
+control_decimation: 4        # policy runs at 1/(dt*dec) = 50 Hz
+
+# --- PD gains (match Isaac Gym training values) -------------------------
+# stiffness = 50 N*m/rad,  damping = 1.0 N*m*s/rad
+# Joint order (URDF): FL_hip, FL_thigh, FL_calf,
+#                     FR_hip, FR_thigh, FR_calf,
+#                     RL_hip, RL_thigh, RL_calf,
+#                     RR_hip, RR_thigh, RR_calf
+kps: [50., 50., 50., 50., 50., 50., 50., 50., 50., 50., 50., 50.]
+kds: [ 1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.]
+
+# --- Default joint angles [rad] (same order as above) ------------------
+default_angles: [ 0.1,  0.8, -1.5,
+                 -0.1,  0.8, -1.5,
+                  0.1,  1.0, -1.5,
+                 -0.1,  1.0, -1.5]
+
+# --- Observation scales (must match legged_robot_config normalization) --
+ang_vel_scale: 0.25    # obs_scales.ang_vel
+dof_pos_scale: 1.0     # obs_scales.dof_pos
+dof_vel_scale: 0.05    # obs_scales.dof_vel
+cmd_lin_scale:  2.0    # commands_scale for lin_vel_x / lin_vel_y
+cmd_ang_scale:  0.25   # commands_scale for ang_vel_yaw
+
+# --- Action scales ------------------------------------------------------
+action_scale: 0.25          # control.action_scale
+residual_action_scale: 0.25 # env.residual_action_scale
+
+# --- Dimensions ---------------------------------------------------------
+num_single_obs: 42      # single-step actor obs (no lin/ang vel)
+num_history_steps: 5    # actor sees 5 * 42 = 210 dims total
+num_dof: 12
+num_actor_output: 15    # 12 residual actions + 3 skill logits
+num_prior_obs: 45       # 42 (patched single-step) + 3 skill
+
+# --- Initial command: [lin_vel_x m/s, lin_vel_y m/s, ang_vel_yaw rad/s]
+# Used as fallback when joystick is disabled or not found.
+cmd_init: [0.5, 0.0, 0.0]
+
+# --- Joystick (gamepad) command interface --------------------------------
+# Axis indices and signs are for a generic PS4 / Xbox controller via SDL2.
+#   Axis 0: Left stick X   (left=-1, right=+1)
+#   Axis 1: Left stick Y   (up=-1,  down=+1)   ← sign_vx=-1 → push up = +vx
+#   Axis 2: Right stick X  (left=-1, right=+1)  ← sign_wz=-1 → push right = -wz
+# Adjust axis indices and signs for your specific controller if needed.
+joystick:
+  enabled: true
+  axis_vx:  1       # left stick Y  →  lin_vel_x
+  axis_vy:  0       # left stick X  →  lin_vel_y
+  axis_wz:  3       # right stick X →  ang_vel_yaw
+  sign_vx: -1       # invert: push up (axis=-1) → positive vx
+  sign_vy: -1       # invert: push left (axis=-1) → positive vy (body-frame left = +Y)
+  sign_wz: -1       # invert: push right (axis=+1) → negative wz (turn right)
+  max_vx:   1.5     # [m/s]
+  max_vy:   0.5     # [m/s]
+  max_wz:   1.57    # [rad/s]
+  deadzone: 0.05    # axis values below this are treated as zero
