@@ -52,7 +52,6 @@ Thumbs.db
 .vscode
 # logs
 logs
-logs_isaacgym
 runs
 
 # other
