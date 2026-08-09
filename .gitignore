@@ -58,3 +58,7 @@ runs
 *.egg-info
 __pycache__
 results
+
+# Downloaded and generated motion datasets
+datasets/external_raw/
+datasets/converted/

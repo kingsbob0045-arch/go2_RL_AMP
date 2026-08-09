@@ -1,0 +1,22 @@
+{
+  "kine2go_review": {
+    "repository": "https://huggingface.co/datasets/kine2go-review/kine2go",
+    "revision": "3698e74f8f9e889697cafc872fb32dd5e8285fb7",
+    "subset": "review_sample",
+    "license": "multi-license; use each clip.json as authoritative",
+    "notes": "The reviewer subset has trot and canter clips but no pace clip. Its SECAMP run is therefore a compatibility screening, not a complete three-skill comparison."
+  },
+  "nju_agility": {
+    "repository": "https://github.com/NJU-RLC/quadrupedal-agility",
+    "revision": "15d16ea99bc23e5d401b0b0e3b88a8edcc28f0ed",
+    "subset": "bbc/mocap_data/mocap_all_lb/{pace,trot,canter}_*.json",
+    "license": "MIT",
+    "notes": "Provides all three SECAMP skill labels."
+  },
+  "dogml": {
+    "repository": "https://github.com/SCUT-BIP-Lab/T2QRM",
+    "dataset_url": "https://drive.google.com/drive/folders/1kMlJPIM0vNosFU3SN_K3F0X1dH1RzgL8",
+    "status": "deferred",
+    "notes": "The official page does not document a data license, frame schema, joint order, robot morphology, or sampling rate. It is not converted or trained until those facts are available."
+  }
+}

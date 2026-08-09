@@ -1,5 +1,6 @@
 import glob
 import json
+import re
 import torch
 import numpy as np
 
@@ -114,9 +115,12 @@ class SECAMPLoader(AMPLoader):
         self.traj_idx_to_skill_id = []  # length == num_trajs; -1 = turn
 
         for i, motion_file in enumerate(motion_files):
-            # Parse skill tag from filename, e.g. "trot0.json" → "trot"
+            # Parse skill tag from filenames such as trot0.json or trot_source.json.
             base = motion_file.split('/')[-1].split('.')[0]  # e.g. "trot0"
-            skill_tag = ''.join(c for c in base if not c.isdigit())  # e.g. "trot"
+            skill_tag = next((
+                name for name in sorted(self._skill_name_to_id, key=len, reverse=True)
+                if re.match(rf"^{re.escape(name)}(?:$|\d|[_-])", base)
+            ), "")
 
             self.trajectory_names.append(base)
 
