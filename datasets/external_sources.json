@@ -1,10 +1,10 @@
 {
-  "kine2go_review": {
+  "kine2go_gaits": {
     "repository": "https://huggingface.co/datasets/kine2go-review/kine2go",
     "revision": "3698e74f8f9e889697cafc872fb32dd5e8285fb7",
-    "subset": "review_sample",
+    "subset": "full reference motions tagged pace, trot, or canter",
     "license": "multi-license; use each clip.json as authoritative",
-    "notes": "The reviewer subset has trot and canter clips but no pace clip. Its SECAMP run is therefore a compatibility screening, not a complete three-skill comparison."
+    "notes": "Downloads only ten small motion.npy reference trajectories and clip metadata. Rollouts, videos, policies, walk, turn, jump, crawl, scoot, and strafe clips are excluded. The three vhdc_horse1_s2 clips use 120 FPS because their stored joint velocities are consistent with 120 FPS rather than the metadata-declared 60 FPS."
   },
   "nju_agility": {
     "repository": "https://github.com/NJU-RLC/quadrupedal-agility",
@@ -16,7 +16,10 @@
   "dogml": {
     "repository": "https://github.com/SCUT-BIP-Lab/T2QRM",
     "dataset_url": "https://drive.google.com/drive/folders/1kMlJPIM0vNosFU3SN_K3F0X1dH1RzgL8",
-    "status": "deferred",
-    "notes": "The official page does not document a data license, frame schema, joint order, robot morphology, or sampling rate. It is not converted or trained until those facts are available."
+    "file_id": "1sb46FX8QBtS8EcgQNFw12AKUgQp9RRIx",
+    "sha256": "9b14e22194126daabeba153ab227dbe77c055b34b4adf46b40cbe6ff0914823d",
+    "subset": "unique robot motions whose complete text label is walk, trot, or run and which pass deterministic movement thresholds",
+    "license": "not specified by the official repository or dataset archive; local research use only",
+    "notes": "Uses the official 60 FPS root-motion plus 16-keypoint RIC schema. Mixed labels and stand, sit, lie, jump, spin, and other non-gait labels are excluded. Near-stationary clips and digest-identical motions carrying conflicting gait labels are also excluded. Motions are morphology-scaled and retargeted to Go2 with analytic inverse kinematics; walk maps to pace, trot to trot, and run to canter."
   }
 }

@@ -16,7 +16,7 @@ parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--amp_preload_transitions", type=int, default=None)
 parser.add_argument(
     "--amp_dataset",
-    choices=("baseline", "kine2go_review", "nju_agility"),
+    choices=("baseline", "mocap_gaits", "kine2go_gaits", "nju_agility", "dogml_gaits"),
     default=None,
     help="SECAMP motion dataset. External datasets must be prepared first.",
 )
@@ -51,8 +51,10 @@ TASKS = {
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AMP_DATASETS = {
     "baseline": "datasets/camp/*",
-    "kine2go_review": "datasets/converted/kine2go_review/*.json",
+    "mocap_gaits": "datasets/converted/mocap_gaits/*",
+    "kine2go_gaits": "datasets/converted/kine2go_gaits/*.json",
     "nju_agility": "datasets/converted/nju_agility/*.json",
+    "dogml_gaits": "datasets/converted/dogml_gaits/*.json",
 }
 
 
