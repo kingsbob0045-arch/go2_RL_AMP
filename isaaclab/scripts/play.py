@@ -6,8 +6,12 @@ import copy
 import json
 import math
 import os
+import select
 import struct
+import sys
+import termios
 import time
+import tty
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -19,11 +23,19 @@ parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--export", type=str, default=None, help="Output TorchScript .pt path")
 parser.add_argument("--steps", type=int, default=None, help="Optional replay-step limit; useful for smoke tests")
 parser.add_argument(
-    "--mode", choices=("autonomous", "joystick", "waypoint"), default="autonomous",
-    help="SECAMP command source: environment waypoints, PS4 joystick, or the legacy fixed waypoint demo.",
+    "--mode", choices=("autonomous", "joystick", "keyboard", "waypoint"), default="autonomous",
+    help="SECAMP command source: environment waypoints, PS4 joystick, keyboard, or the legacy fixed waypoint demo.",
 )
 parser.add_argument("--joystick-device", default="/dev/input/js0", help="Linux joystick device used with --mode joystick")
 parser.add_argument("--deadzone", type=float, default=0.1, help="PS4 left-stick deadzone")
+parser.add_argument(
+    "--stick-mode", choices=("latch", "hold"), default="latch",
+    help="Keyboard stick behaviour; see go2_Deploy scripts/keyboard_command.py",
+)
+parser.add_argument(
+    "--hold-timeout", type=float, default=0.6,
+    help="With --stick-mode hold, seconds without auto-repeat before a stick centres",
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 simulation_app = AppLauncher(args).app
@@ -51,6 +63,39 @@ LEGACY_SECAMP_WAYPOINTS = (
     (0.0, 0.0, 0), (8.0, 0.0, 0), (16.0, 0.0, 1),
     (24.0, 0.0, 1), (32.0, 0.0, 2), (40.0, 0.0, 2), (48.0, 0.0, -1),
 )
+
+
+def _apply_stick_command(task_env, axes, buttons, deadzone: float) -> None:
+    """Shared L1+R1 enable, dead-zone, and no-backwards rules from deploy_secamp.py."""
+    enabled = len(buttons) > 5 and buttons[4] and buttons[5]
+    forward = axes[1] if len(axes) > 1 and abs(axes[1]) > deadzone else 0.0
+    lateral = axes[0] if len(axes) > 0 and abs(axes[0]) > deadzone else 0.0
+    norm = math.hypot(forward, lateral)
+    if not enabled or forward < 0.0 or norm < 1.0e-6:
+        forward, lateral = 0.0, 0.0
+    else:
+        forward, lateral = forward / norm, lateral / norm
+    task_env.commands[:, 0] = forward
+    task_env.commands[:, 1] = lateral
+    task_env.commands[:, 2] = 0.0
+
+
+def _apply_skill_edges(task_env, buttons, previous_buttons: list) -> list:
+    """Switch skill on the rising edge of X/O/triangle; return the new previous state."""
+    if len(previous_buttons) != len(buttons):
+        previous_buttons = [False] * len(buttons)
+    for skill, button_id in enumerate((0, 1, 2)):
+        if button_id < len(buttons) and buttons[button_id] and not previous_buttons[button_id]:
+            _set_skill(task_env, skill)
+            print(f"Skill -> {SKILL_NAMES[skill]}")
+    return list(buttons)
+
+
+def _triggers_pressed(axes) -> bool:
+    """L2+R2 fully pressed means quit, matching low_level_ctrl.cpp."""
+    left_trigger = axes[2] if len(axes) > 2 else 1.0
+    right_trigger = axes[5] if len(axes) > 5 else 1.0
+    return left_trigger <= -0.99 and right_trigger <= -0.99
 
 
 class LegacyPs4Joystick:
@@ -85,31 +130,9 @@ class LegacyPs4Joystick:
         """Write the command/skill tensors.  Return True when replay should exit."""
         self._read_events()
         axes, buttons = self._axes, self._buttons
-
-        # Same enable, direction, dead-zone, and no-backwards rules as deploy_secamp.py.
-        enabled = len(buttons) > 5 and buttons[4] and buttons[5]
-        forward = axes[1] if len(axes) > 1 and abs(axes[1]) > self._deadzone else 0.0
-        lateral = axes[0] if len(axes) > 0 and abs(axes[0]) > self._deadzone else 0.0
-        norm = math.hypot(forward, lateral)
-        if not enabled or forward < 0.0 or norm < 1.0e-6:
-            forward, lateral = 0.0, 0.0
-        else:
-            forward, lateral = forward / norm, lateral / norm
-        task_env.commands[:, 0] = forward
-        task_env.commands[:, 1] = lateral
-        task_env.commands[:, 2] = 0.0
-
-        if len(self._previous_buttons) != len(buttons):
-            self._previous_buttons = [False] * len(buttons)
-        for skill, button_id in enumerate((0, 1, 2)):
-            if button_id < len(buttons) and buttons[button_id] and not self._previous_buttons[button_id]:
-                _set_skill(task_env, skill)
-                print(f"Skill -> {SKILL_NAMES[skill]}")
-        self._previous_buttons = buttons
-
-        left_trigger = axes[2] if len(axes) > 2 else 1.0
-        right_trigger = axes[5] if len(axes) > 5 else 1.0
-        return left_trigger <= -0.99 and right_trigger <= -0.99
+        _apply_stick_command(task_env, axes, buttons, self._deadzone)
+        self._previous_buttons = _apply_skill_edges(task_env, buttons, self._previous_buttons)
+        return _triggers_pressed(axes)
 
     def _read_events(self) -> None:
         """Drain /dev/input/js*; Linux joystick_event is uint32, int16, uint8, uint8."""
@@ -141,6 +164,130 @@ def _set_skill(task_env, skill: int) -> None:
     task_env.skill_commands[:, skill] = 1.0
 
 
+# Key map, axis/button indices, and stick semantics are deliberately identical to
+# go2_Deploy/src/deploy_rl_policy/scripts/keyboard_command.py.  Keep the two in sync.
+_STICK_KEYS = {
+    "w": (1, 1.0), "s": (1, -1.0), "a": (0, 1.0), "d": (0, -1.0),
+    "up": (4, 1.0), "down": (4, -1.0), "left": (3, 1.0), "right": (3, -1.0),
+}
+_PULSE_KEYS = {"q": 0, "e": 1, "r": 2}
+_ESCAPE_SEQUENCES = {"[A": "up", "[B": "down", "[C": "right", "[D": "left"}
+
+_KEYBOARD_HELP = """
+  keyboard -> Isaac Sim
+  ---------------------------------------------------------------
+   c            toggle L1+R1 latch  -> enables the direction command
+   w / s        forward  / backward (left stick)
+   a / d        left     / right    (left stick)
+   arrows       right stick
+   q / e / r    skill pace / trot / canter
+   space        centre every stick
+   x            quit the replay (same as L2+R2)
+   ? or h       show this map again
+  ---------------------------------------------------------------
+"""
+
+
+class LegacyKeyboard:
+    """Drive SECAMP from the terminal using the keyboard_command.py key map.
+
+    Emulates the same gamepad state a PS4 pad would produce, so the enable,
+    dead-zone, and skill rules above stay shared with --mode joystick.
+    """
+
+    def __init__(self, deadzone: float, stick_mode: str, hold_timeout: float):
+        self._deadzone = deadzone
+        self._stick_mode = stick_mode
+        self._hold_timeout = hold_timeout
+        self._axes = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]
+        self._buttons = [0] * 8
+        self._latched = False
+        self._quit = False
+        self._pulse_until: dict[int, float] = {}
+        self._stick_seen: dict[str, float] = {}
+        self._previous_buttons: list = []
+        self._fd = sys.stdin.fileno()
+        if not os.isatty(self._fd):
+            raise RuntimeError(
+                "--mode keyboard needs an interactive terminal. Start play.py directly in a "
+                "terminal rather than through a pipe or nohup.")
+        self._saved = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        print(_KEYBOARD_HELP, flush=True)
+
+    def close(self) -> None:
+        termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+
+    def _poll_keys(self) -> list:
+        keys = []
+        while select.select([self._fd], [], [], 0)[0]:
+            char = os.read(self._fd, 1).decode("utf-8", errors="ignore")
+            if not char:
+                break
+            if char == "\x1b":
+                sequence = ""
+                while len(sequence) < 2 and select.select([self._fd], [], [], 0.005)[0]:
+                    sequence += os.read(self._fd, 1).decode("utf-8", errors="ignore")
+                keys.append(_ESCAPE_SEQUENCES.get(sequence, "x"))
+            elif char == " ":
+                keys.append("space")
+            elif char == "\x03":
+                keys.append("x")
+            else:
+                keys.append(char.lower())
+        return keys
+
+    def _handle_key(self, key: str, now: float) -> None:
+        if key in _PULSE_KEYS:
+            button = _PULSE_KEYS[key]
+            self._buttons[button] = 1
+            self._pulse_until[button] = now + 0.15
+        elif key == "c":
+            self._latched = not self._latched
+            print("L1+R1 LATCHED" if self._latched else "L1+R1 released")
+        elif key in _STICK_KEYS:
+            axis, value = _STICK_KEYS[key]
+            if self._stick_mode == "hold":
+                self._axes[axis] = value
+                self._stick_seen[key] = now
+            elif self._axes[axis] == value:
+                self._axes[axis] = 0.0
+            else:
+                self._axes[axis] = value
+        elif key == "space":
+            for axis in (0, 1, 3, 4):
+                self._axes[axis] = 0.0
+            self._stick_seen.clear()
+        elif key == "x":
+            self._quit = True
+        elif key in ("?", "h"):
+            print(_KEYBOARD_HELP, flush=True)
+
+    def update(self, task_env) -> bool:
+        now = time.monotonic()
+        for key in self._poll_keys():
+            self._handle_key(key, now)
+
+        for button, deadline in list(self._pulse_until.items()):
+            if now >= deadline:
+                self._buttons[button] = 0
+                del self._pulse_until[button]
+        if self._stick_mode == "hold":
+            for key, last_seen in list(self._stick_seen.items()):
+                if now - last_seen > self._hold_timeout:
+                    axis, value = _STICK_KEYS[key]
+                    if self._axes[axis] == value:
+                        self._axes[axis] = 0.0
+                    del self._stick_seen[key]
+        held = 1 if self._latched else 0
+        self._buttons[4] = held
+        self._buttons[5] = held
+
+        _apply_stick_command(task_env, self._axes, self._buttons, self._deadzone)
+        self._previous_buttons = _apply_skill_edges(task_env, self._buttons, self._previous_buttons)
+        return self._quit
+
+
 def _apply_legacy_waypoint(task_env, start_time: float) -> None:
     """Apply the former deploy_secamp.py fixed pace/trot/canter demonstration."""
     elapsed = time.monotonic() - start_time
@@ -166,10 +313,10 @@ class ExportedPolicy(torch.nn.Module):
 
 def main():
     cfg_factory, runner_type, policy_kind = TASKS[args.task]
-    if args.mode != "autonomous" and policy_kind != "secamp":
-        raise ValueError("--mode joystick/waypoint is currently defined for Isaac-Go2-SECAMP-Direct-v0 only")
-    if args.mode == "joystick" and args.num_envs != 1:
-        raise ValueError("Use --num_envs 1 with --mode joystick so the displayed robot has one controller")
+    if args.mode not in ("autonomous", "waypoint") and policy_kind != "secamp":
+        raise ValueError("--mode joystick/keyboard/waypoint is currently defined for Isaac-Go2-SECAMP-Direct-v0 only")
+    if args.mode in ("joystick", "keyboard") and args.num_envs != 1:
+        raise ValueError(f"Use --num_envs 1 with --mode {args.mode} so the displayed robot has one controller")
     env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
     env_cfg.add_observation_noise = False
     env_cfg.reference_state_initialization = False
@@ -190,9 +337,14 @@ def main():
     print("Inference policy ready.", flush=True)
     observations, _ = env.reset()
     print("Environment reset.", flush=True)
-    joystick = LegacyPs4Joystick(args.joystick_device, args.deadzone) if args.mode == "joystick" else None
-    if joystick is not None:
+    if args.mode == "joystick":
+        command_source = LegacyPs4Joystick(args.joystick_device, args.deadzone)
         print("Joystick input ready.", flush=True)
+    elif args.mode == "keyboard":
+        command_source = LegacyKeyboard(args.deadzone, args.stick_mode, args.hold_timeout)
+        print("Keyboard input ready.", flush=True)
+    else:
+        command_source = None
     waypoint_start = time.monotonic()
 
     if args.export:
@@ -214,18 +366,22 @@ def main():
         print(f"Exported {output} and {sidecar}")
 
     replay_steps = 0
-    while simulation_app.is_running():
-        if joystick is not None:
-            if joystick.update(env.env):
-                print("L2+R2 pressed: stopping Isaac Sim replay.")
+    try:
+        while simulation_app.is_running():
+            if command_source is not None:
+                if command_source.update(env.env):
+                    print(f"\nStop requested: ending Isaac Sim replay ({args.mode} mode).")
+                    break
+            elif args.mode == "waypoint":
+                _apply_legacy_waypoint(env.env, waypoint_start)
+            with torch.inference_mode():
+                observations, _, _, _, _, _, _ = env.step(policy(observations))
+            replay_steps += 1
+            if args.steps is not None and replay_steps >= args.steps:
                 break
-        elif args.mode == "waypoint":
-            _apply_legacy_waypoint(env.env, waypoint_start)
-        with torch.inference_mode():
-            observations, _, _, _, _, _, _ = env.step(policy(observations))
-        replay_steps += 1
-        if args.steps is not None and replay_steps >= args.steps:
-            break
+    finally:
+        if isinstance(command_source, LegacyKeyboard):
+            command_source.close()
     env.close()
 
 

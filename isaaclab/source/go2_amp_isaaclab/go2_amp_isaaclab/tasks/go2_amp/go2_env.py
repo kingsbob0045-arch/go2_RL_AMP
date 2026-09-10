@@ -121,9 +121,10 @@ class Go2AmpEnv(DirectRLEnv):
             prior_obs[:, 5] = 0.0
             with torch.inference_mode():
                 prior_action = self._motion_prior(torch.cat((prior_obs, skill), dim=-1))
-            self.actions = (prior_action + self.cfg.residual_action_scale * residual).clamp(-1.0, 1.0)
+            clip = self.cfg.action_clip
+            self.actions = (prior_action + self.cfg.residual_action_scale * residual).clamp(-clip, clip)
         else:
-            actor_output = actions.clamp(-1.0, 1.0)
+            actor_output = actions.clamp(-self.cfg.action_clip, self.cfg.action_clip)
             self.actions = actor_output[:, :12]
         self._joint_targets = self.default_joint_pos + self.cfg.action_scale * self.actions
 
@@ -191,6 +192,8 @@ class Go2AmpEnv(DirectRLEnv):
             yaw_err = torch.square(self.commands[:, 2] - self.robot.data.root_ang_vel_b[:, 2])
             reward = self.cfg.tracking_lin_vel_scale * torch.exp(-lin_err / self.cfg.tracking_sigma)
             reward += self.cfg.tracking_ang_vel_scale * torch.exp(-yaw_err / self.cfg.tracking_sigma)
+        if self.cfg.only_positive_rewards:
+            reward = reward.clamp(min=0.0)
         return reward * self.step_dt
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -297,7 +300,13 @@ class Go2AmpEnv(DirectRLEnv):
             ids = at_last.nonzero(as_tuple=False).flatten()
             self._resample_skills(ids)
             self._resample_waypoints(ids)
-        current = self._waypoints[self._all_env_ids, self._waypoint_index]
+        official = self._waypoints[self._all_env_ids, self._waypoint_index]
+        can_lookahead = (
+            (torch.norm(self.robot.data.root_pos_w[:, :2] - official, dim=-1)
+             < self.cfg.waypoint_lookahead_threshold)
+            & (self._waypoint_index < 1)
+        )
+        current = self._waypoints[self._all_env_ids, self._waypoint_index + can_lookahead.long()]
         delta = current - self.robot.data.root_pos_w[:, :2]
         distance = delta.norm(dim=-1, keepdim=True).clamp(min=1.0e-6)
         delta = delta / distance * distance.clamp(max=1.0)

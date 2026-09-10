@@ -229,25 +229,43 @@ class AMPLoader:
         blend = p * n - idx_low
         return self.blend_frame_pose(frame_start, frame_end, blend)
 
+    def _stacked_trajectories(self):
+        """Cache every full trajectory in one tensor plus per-trajectory row offsets.
+
+        Lets get_full_frame_at_time_batch() gather with two index operations instead of
+        looping over the unique trajectory ids, which cost minutes once a dataset holds
+        a thousand or more clips.
+        """
+        if getattr(self, "_stacked_full", None) is None:
+            row_counts = np.array([len(trajectory) for trajectory in self.trajectories_full],
+                                  dtype=np.int64)
+            row_offsets = np.zeros(len(row_counts), dtype=np.int64)
+            row_offsets[1:] = np.cumsum(row_counts[:-1])
+            self._stacked_full = torch.cat(self.trajectories_full, dim=0)
+            self._stacked_row_offsets = row_offsets
+            self._stacked_row_counts = row_counts
+        return self._stacked_full, self._stacked_row_offsets, self._stacked_row_counts
+
     def get_full_frame_at_time_batch(self, traj_idxs, times):
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
         idx_low, idx_high = np.floor(p * n).astype(np.int_), np.ceil(p * n).astype(np.int_)
-        all_frame_pos_starts = torch.zeros(len(traj_idxs), AMPLoader.POS_SIZE, device=self.device)
-        all_frame_pos_ends = torch.zeros(len(traj_idxs), AMPLoader.POS_SIZE, device=self.device)
-        all_frame_rot_starts = torch.zeros(len(traj_idxs), AMPLoader.ROT_SIZE, device=self.device)
-        all_frame_rot_ends = torch.zeros(len(traj_idxs), AMPLoader.ROT_SIZE, device=self.device)
-        all_frame_amp_starts = torch.zeros(len(traj_idxs), AMPLoader.JOINT_VEL_END_IDX - AMPLoader.JOINT_POSE_START_IDX, device=self.device)
-        all_frame_amp_ends = torch.zeros(len(traj_idxs),  AMPLoader.JOINT_VEL_END_IDX - AMPLoader.JOINT_POSE_START_IDX, device=self.device)
-        for traj_idx in set(traj_idxs):
-            trajectory = self.trajectories_full[traj_idx]
-            traj_mask = traj_idxs == traj_idx
-            all_frame_pos_starts[traj_mask] = AMPLoader.get_root_pos_batch(trajectory[idx_low[traj_mask]])
-            all_frame_pos_ends[traj_mask] = AMPLoader.get_root_pos_batch(trajectory[idx_high[traj_mask]])
-            all_frame_rot_starts[traj_mask] = AMPLoader.get_root_rot_batch(trajectory[idx_low[traj_mask]])
-            all_frame_rot_ends[traj_mask] = AMPLoader.get_root_rot_batch(trajectory[idx_high[traj_mask]])
-            all_frame_amp_starts[traj_mask] = trajectory[idx_low[traj_mask]][:, AMPLoader.JOINT_POSE_START_IDX:AMPLoader.JOINT_VEL_END_IDX]
-            all_frame_amp_ends[traj_mask] = trajectory[idx_high[traj_mask]][:, AMPLoader.JOINT_POSE_START_IDX:AMPLoader.JOINT_VEL_END_IDX]
+
+        stacked, row_offsets, row_counts = self._stacked_trajectories()
+        traj_idxs = np.asarray(traj_idxs)
+        offsets = row_offsets[traj_idxs]
+        last_row = row_counts[traj_idxs] - 1
+        rows_low = stacked[torch.as_tensor(offsets + np.clip(idx_low, 0, last_row),
+                                           device=self.device)]
+        rows_high = stacked[torch.as_tensor(offsets + np.clip(idx_high, 0, last_row),
+                                            device=self.device)]
+
+        all_frame_pos_starts = AMPLoader.get_root_pos_batch(rows_low)
+        all_frame_pos_ends = AMPLoader.get_root_pos_batch(rows_high)
+        all_frame_rot_starts = AMPLoader.get_root_rot_batch(rows_low)
+        all_frame_rot_ends = AMPLoader.get_root_rot_batch(rows_high)
+        all_frame_amp_starts = rows_low[:, AMPLoader.JOINT_POSE_START_IDX:AMPLoader.JOINT_VEL_END_IDX]
+        all_frame_amp_ends = rows_high[:, AMPLoader.JOINT_POSE_START_IDX:AMPLoader.JOINT_VEL_END_IDX]
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
 
         pos_blend = self.slerp(all_frame_pos_starts, all_frame_pos_ends, blend)

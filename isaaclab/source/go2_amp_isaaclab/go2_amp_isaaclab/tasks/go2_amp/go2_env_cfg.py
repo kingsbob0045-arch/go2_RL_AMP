@@ -1,13 +1,14 @@
 """Isaac Lab configurations preserving the legacy sim-to-real contract."""
 
 import isaaclab.sim as sim_utils
+from isaaclab.actuators import IdealPDActuatorCfg
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg, mdp
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
-from isaaclab.sim import SimulationCfg
+from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.terrains.height_field import HfPyramidSlopedTerrainCfg
 from isaaclab.terrains.trimesh import MeshRandomGridTerrainCfg
@@ -26,8 +27,22 @@ GO2_JOINT_NAMES = (
 def _go2_cfg() -> ArticulationCfg:
     cfg = UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     cfg.init_state.pos = (0.0, 0.0, 0.38)
-    cfg.actuators["base_legs"].stiffness = 50.0
-    cfg.actuators["base_legs"].damping = 1.0
+    # Isaac Lab ships the Go2 with a DC-motor model whose available torque decays linearly
+    # with joint speed (tau_max = 23.5 * (1 - qd/30)), so at the ~15 rad/s reached during a
+    # 3 m/s canter the robot only has half its torque.  The legged_gym reference this project
+    # reproduces applies a plain +/- URDF-effort clip with no speed droop, and gives the calf
+    # its true 35.55 Nm instead of a blanket 23.5 Nm.  IdealPDActuator is the exact analogue:
+    # tau = Kp (q* - q) - Kd qd, clipped to the effort limit.
+    cfg.actuators = {
+        "hip_thigh": IdealPDActuatorCfg(
+            joint_names_expr=[".*_hip_joint", ".*_thigh_joint"],
+            effort_limit=23.7, stiffness=50.0, damping=1.0, friction=0.0,
+        ),
+        "calf": IdealPDActuatorCfg(
+            joint_names_expr=[".*_calf_joint"],
+            effort_limit=35.55, stiffness=50.0, damping=1.0, friction=0.0,
+        ),
+    }
     return cfg
 
 
@@ -81,12 +96,26 @@ class Go2AmpEnvCfg(DirectRLEnvCfg):
     state_space = 48
     action_scale = 0.25
     observation_clip = 100.0
+    # legged_gym clips actions at +/-100, not +/-1.  Clipping at the action range makes the
+    # environment blind to any sampled action beyond it, which removes the surrogate loss's
+    # only downward pressure on the policy std and lets the entropy bonus grow it without
+    # bound (observed: std 1 -> 38 over 2000 iterations).
+    action_clip = 100.0
 
     sim: SimulationCfg = SimulationCfg(
         dt=0.005,
         render_interval=decimation,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             static_friction=1.0, dynamic_friction=1.0, restitution=0.0,
+        ),
+        # Defaults overflow the contact-patch stream past ~8k environments, which silently
+        # drops contacts.  These ceilings cover 16384 environments with headroom and are
+        # numerically inert whenever the default buffers would already have sufficed.
+        physx=PhysxCfg(
+            gpu_max_rigid_patch_count=2**19,
+            gpu_found_lost_pairs_capacity=2**23,
+            gpu_total_aggregate_pairs_capacity=2**23,
+            gpu_collision_stack_size=2**27,
         ),
     )
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
@@ -114,6 +143,10 @@ class Go2AmpEnvCfg(DirectRLEnvCfg):
     tracking_ang_vel_scale = 0.5
     tracking_sigma = 0.25
     termination_contact_force = 1.0
+    # legged_gym's LeggedRobotCfg.rewards.only_positive_rewards, which the reference SECAMP
+    # config inherits: "avoids early termination problems" caused by a negative task reward
+    # making suicide the best available action early in training.
+    only_positive_rewards = True
 
     add_observation_noise = True
     gravity_noise = 0.05
@@ -121,7 +154,10 @@ class Go2AmpEnvCfg(DirectRLEnvCfg):
     dof_vel_noise = 1.5
     motion_glob = "datasets/mocap_motions_go2/*"
     reference_state_initialization = True
-    reference_state_initialization_prob = 0.85
+    # The legged_gym reference declares 0.85 but never reads it: reset_idx applies reference
+    # state initialization to every environment.  Resetting 15% of environments into a
+    # randomised default pose with random root velocity mostly produced instant terminations.
+    reference_state_initialization_prob = 1.0
     amp_horizon = 1
     skill_dim = 0
     waypoint_mode = False
@@ -146,6 +182,10 @@ class Go2SecampEnvCfg(Go2AmpEnvCfg):
     skill_speed_limits = (1.0, 1.5, 3.0)
     waypoint_distance_range = (5.0, 15.0)
     waypoint_arrival_threshold = 0.1
+    # Switch the observed target to the next waypoint before actually arriving, so the command
+    # magnitude does not shrink on approach.  Without it every waypoint carries a deceleration
+    # incentive that fights the canter speed target.
+    waypoint_lookahead_threshold = 0.3
     waypoint_max_turn_angle = 1.5708
 
 

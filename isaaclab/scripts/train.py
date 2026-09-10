@@ -22,6 +22,16 @@ parser.add_argument(
 )
 parser.add_argument("--run_name", type=str, default=None, help="TensorBoard run label.")
 parser.add_argument(
+    "--early_stop",
+    action="store_true",
+    help="Stop once every convergence criterion in rsl_rl.utils.convergence holds for 100 "
+         "consecutive iterations, and save model_converged.pt.",
+)
+parser.add_argument(
+    "--early_stop_min_iterations", type=int, default=500,
+    help="Never declare convergence before this iteration.",
+)
+parser.add_argument(
     "--disable_reference_state_initialization",
     action="store_true",
     help="Reset from the robot default state instead of sampled motion frames.",
@@ -99,6 +109,12 @@ def main():
         log_dir = log_root / timestamp
     log_dir.mkdir(parents=True, exist_ok=True)
     runner = runner_type(env, train_cfg, log_dir=str(log_dir), device=args.device)
+    if args.early_stop:
+        if not hasattr(runner, "_convergence"):
+            raise ValueError(f"--early_stop is not supported by {runner_type.__name__}")
+        from rsl_rl.utils.convergence import ConvergenceMonitor
+        runner._convergence = ConvergenceMonitor(min_iterations=args.early_stop_min_iterations)
+        print(f"Early stopping enabled (minimum {args.early_stop_min_iterations} iterations)", flush=True)
     if args.checkpoint:
         runner.load(args.checkpoint)
     runner.learn(train_cfg["runner"]["max_iterations"], init_at_random_ep_len=True)

@@ -1,0 +1,31 @@
+{
+  "format_version": 1,
+  "source": "Isaac Lab",
+  "task": "Isaac-Go2-SECAMP-Direct-v0",
+  "policy_kind": "secamp",
+  "joint_order": [
+    "FL_hip_joint",
+    "FL_thigh_joint",
+    "FL_calf_joint",
+    "FR_hip_joint",
+    "FR_thigh_joint",
+    "FR_calf_joint",
+    "RL_hip_joint",
+    "RL_thigh_joint",
+    "RL_calf_joint",
+    "RR_hip_joint",
+    "RR_thigh_joint",
+    "RR_calf_joint"
+  ],
+  "observation_dim": 45,
+  "action_dim": 12,
+  "base_observation_layout": [
+    "projected_gravity",
+    "command",
+    "joint_position",
+    "joint_velocity",
+    "last_action"
+  ],
+  "action_scale": 0.25,
+  "control_dt": 0.02
+}

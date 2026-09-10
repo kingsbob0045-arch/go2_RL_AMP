@@ -95,12 +95,19 @@ class Go2SECAMPRunner:
         min_std = (
             torch.tensor(self.cfg["min_normalized_std"], device=self.device) *
             torch.abs(self.env.dof_pos_limits[:, 1] - self.env.dof_pos_limits[:, 0]))
+        # The environment no longer clips actions at the action range, so the surrogate loss
+        # can regulate std on its own as it does in the legged_gym reference.  This ceiling is
+        # only a runaway guard; it sits above ConvergenceMonitor.STD_MAX so a pathological run
+        # is reported as non-converged instead of quietly stopping at the clamp.
+        max_std = self.cfg.get("max_action_std", 4.0)
         self.alg = SECAMPPPO(
             actor_critic, discriminator, amp_data, amp_normalizer,
-            device=self.device, min_std=min_std, **self.alg_cfg)
+            device=self.device, min_std=min_std, max_std=max_std, **self.alg_cfg)
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval     = self.cfg["save_interval"]
+        # Optional early stop; enabled by train.py via --early_stop.
+        self._convergence = None
 
         self.alg.init_storage(
             self.env.num_envs, self.num_steps_per_env,
@@ -259,6 +266,26 @@ class Go2SECAMPRunner:
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
             ep_infos.clear()
+
+            if self._convergence is not None and len(rewbuffer) > 0:
+                self._convergence.update(
+                    reward=statistics.mean(rewbuffer),
+                    episode_length=statistics.mean(lenbuffer),
+                    noise_std=float(self.alg.actor_critic.std.mean()),
+                    amp_loss=mean_amp_loss,
+                    d_expert=mean_expert_pred,
+                    d_policy=mean_policy_pred,
+                    value_loss=mean_value_loss,
+                )
+                if it % 100 == 0:
+                    print(self._convergence.summary(), flush=True)
+                if self._convergence.should_stop(it):
+                    print(f"\n=== CONVERGED at iteration {it} ===", flush=True)
+                    print(self._convergence.summary(), flush=True)
+                    self.current_learning_iteration = it + 1
+                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it + 1)))
+                    self.save(os.path.join(self.log_dir, 'model_converged.pt'))
+                    return
 
         self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir,

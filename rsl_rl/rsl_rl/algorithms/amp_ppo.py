@@ -58,6 +58,7 @@ class AMPPPO:
                  device='cpu',
                  amp_replay_buffer_size=100000,
                  min_std=None,
+                 max_std=None,
                  ):
 
         self.device = device
@@ -66,6 +67,7 @@ class AMPPPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.min_std = min_std
+        self.max_std = max_std
 
         # Discriminator components
         self.discriminator = discriminator
@@ -250,6 +252,9 @@ class AMPPPO:
 
                 if not self.actor_critic.fixed_std and self.min_std is not None:
                     self.actor_critic.std.data = self.actor_critic.std.data.clamp(min=self.min_std)
+                # See secamp_ppo.py: the entropy bonus plus Adam grows std without bound.
+                if not self.actor_critic.fixed_std and self.max_std is not None:
+                    self.actor_critic.std.data = self.actor_critic.std.data.clamp(max=self.max_std)
 
                 if self.amp_normalizer is not None:
                     self.amp_normalizer.update(policy_state.cpu().numpy())

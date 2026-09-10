@@ -33,6 +33,7 @@ class SECAMPPPO:
                  device='cpu',
                  amp_replay_buffer_size=100_000,
                  min_std=None,
+                 max_std=None,
                  ):
 
         self.device = device
@@ -41,6 +42,7 @@ class SECAMPPPO:
         self.learning_rate = learning_rate
         self.disc_learning_rate = disc_learning_rate if disc_learning_rate is not None else learning_rate
         self.min_std = min_std
+        self.max_std = max_std
 
         # Discriminator
         self.discriminator = discriminator
@@ -270,6 +272,13 @@ class SECAMPPPO:
 
             if not self.actor_critic.fixed_std and self.min_std is not None:
                 self.actor_critic.std.data = self.actor_critic.std.data.clamp(min=self.min_std)
+            # The entropy bonus has no upper bound of its own, and Adam normalises its
+            # gradient, so std otherwise grows by roughly learning_rate per update
+            # regardless of how large it already is.  Actions are clamped to [-1, 1], so
+            # once std reaches the action range the extra noise only produces bang-bang
+            # control and destroys the imitation signal.
+            if not self.actor_critic.fixed_std and self.max_std is not None:
+                self.actor_critic.std.data = self.actor_critic.std.data.clamp(max=self.max_std)
 
             if self.amp_normalizer is not None:
                 self.amp_normalizer.update(pol_flat.cpu().numpy())

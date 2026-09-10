@@ -93,7 +93,12 @@ class AMPOnPolicyRunner:
         min_std = (
             torch.tensor(self.cfg["min_normalized_std"], device=self.device) *
             (torch.abs(self.env.dof_pos_limits[:, 1] - self.env.dof_pos_limits[:, 0])))
-        self.alg: PPO = alg_class(actor_critic, discriminator, amp_data, amp_normalizer, device=self.device, min_std=min_std, **self.alg_cfg)
+        # The environment no longer clips actions at the action range, so the surrogate loss
+        # can regulate std on its own as it does in the legged_gym reference.  This ceiling is
+        # only a runaway guard; it sits above ConvergenceMonitor.STD_MAX so a pathological run
+        # is reported as non-converged instead of quietly stopping at the clamp.
+        max_std = self.cfg.get("max_action_std", 4.0)
+        self.alg: PPO = alg_class(actor_critic, discriminator, amp_data, amp_normalizer, device=self.device, min_std=min_std, max_std=max_std, **self.alg_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
 

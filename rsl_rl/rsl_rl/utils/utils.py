@@ -170,7 +170,10 @@ def quaternion_slerp(q0, q1, fraction, spin=0, shortestpath=True):
         d = torch.where(d_old < 0, -d, d)
         q1 = torch.where(d_old < 0, -q1, q1)
 
-    angle = torch.acos(d) + spin * torch.pi
+    # d is a dot product of unit quaternions, so it is mathematically in [-1, 1].  In
+    # float32 it routinely lands a few 1e-7 outside that range, which is far larger than
+    # the float64 _EPS guard above, and acos() then returns NaN.  Clamping is exact.
+    angle = torch.acos(d.clamp(-1.0, 1.0)) + spin * torch.pi
     angle_mask = (torch.abs(angle) < _EPS).squeeze()
     out[angle_mask] = q0[angle_mask]
 
