@@ -54,6 +54,9 @@ def go2_secamp_runner_cfg() -> dict:
     cfg["seed"] = 77
     cfg["policy"].update(actor_hidden_dims=[1024, 512, 256], critic_hidden_dims=[1024, 512, 256])
     cfg["algorithm"]["disc_learning_rate"] = 1.0e-3
+    # Starting point only -- SECAMPPPO moves it to hold d_expert inside this band.  See the
+    # controller comment in rsl_rl/algorithms/secamp_ppo.py for why a fixed rate cannot.
+    cfg["algorithm"]["disc_target_expert"] = (0.70, 0.80)
     cfg["runner"].update({
         "algorithm_class_name": "SECAMPPPO", "experiment_name": "go2_secamp_isaaclab",
         "save_interval": 200, "amp_motion_files": _motions("datasets/camp/*"),

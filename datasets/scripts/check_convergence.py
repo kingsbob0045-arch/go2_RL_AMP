@@ -34,6 +34,18 @@ REWARD_PLATEAU_TOL = 0.02
 STD_MAX = 3.0
 STD_SLOPE_TOL = 0.01  # see rsl_rl/utils/convergence.py; guards against polyfit noise
 DISC_ABS_MAX = 0.80
+# Two-sided, matching rsl_rl/utils/convergence.py.  The ceiling alone passes a discriminator
+# that has collapsed to d = 0 for every input, which is the opposite failure and the one this
+# project actually hit: the AMP reward is coef * clamp(1 - (d-1)^2/4, 0) * dt, so d = 0 pays
+# 75% of the maximum imitation reward for any motion whatsoever.
+# Set just below the controller's band low edge (0.70), so the criterion reads as "the
+# discriminator balance controller is still holding its setpoint".  At a looser 0.60 the
+# dogml v3 run passed with d_expert 0.634 and was declared converged -- the exact run whose
+# d_expert had fallen from 0.765 to 0.629 while its imitation reward rose from 9.8 to 12.9.
+# Separation 1.0 is likewise well inside what a healthy run shows (v2 and v3 both ran at
+# 1.27-1.42) while still ruling out a collapse towards 0.
+DISC_EXPERT_MIN = 0.65
+DISC_SEPARATION_MIN = 1.00
 AMP_LOSS_MIN = 0.02
 VALUE_LOSS_TOL = 0.05
 
@@ -78,6 +90,13 @@ def evaluate(run_dir: Path) -> dict:
     d_expert = _scalars(accumulator, "Disc/d_expert")
     d_policy = _scalars(accumulator, "Disc/d_policy")
     value_loss = _scalars(accumulator, "Loss/value_function")
+    # Added after the v4 runs, so these are empty for anything trained before them.
+    term_contact = _scalars(accumulator, "Episode/term_contact_rate")
+    term_timeout = _scalars(accumulator, "Episode/term_timeout_rate")
+    # Posture, added at the same time.  -1.0 means the run predates the scalar.
+    posture = {name: _scalars(accumulator, f"Episode/{name}")
+               for name in ("base_height", "gravity_x", "gravity_y", "foot_contacts",
+                            "stance_width")}
 
     first_step = accumulator.Scalars("Train/mean_reward")[0].step
     last_step = accumulator.Scalars("Train/mean_reward")[-1].step
@@ -92,6 +111,16 @@ def evaluate(run_dir: Path) -> dict:
     amp_loss_mean = float(amp_loss[-BLOCK:].mean())
     d_expert_mean = float(d_expert[-BLOCK:].mean())
     d_policy_mean = float(d_policy[-BLOCK:].mean())
+    # Share of ended episodes that reached the time limit rather than falling.  Episode length
+    # alone cannot separate "survives 300 steps then falls" from "the task ends at 300", and
+    # every run before this scalar existed left that question open.  -1.0 marks "not logged".
+    contact_rate = float(term_contact[-BLOCK:].mean()) if len(term_contact) else 0.0
+    timeout_rate = float(term_timeout[-BLOCK:].mean()) if len(term_timeout) else 0.0
+    ended_rate = contact_rate + timeout_rate
+    timeout_share = timeout_rate / ended_rate if ended_rate > 0 else (
+        -1.0 if not len(term_contact) else 0.0)
+    posture_means = {name: (round(float(values[-BLOCK:].mean()), 3) if len(values) else -1.0)
+                     for name, values in posture.items()}
     reward_blocks = _block_means(reward)
     value_blocks = _block_means(value_loss, blocks=2)
 
@@ -120,9 +149,11 @@ def evaluate(run_dir: Path) -> dict:
         "episode_length_flat": abs(episode_slope) < 0.005 * MAX_EPISODE_STEPS,
         "reward_plateau": reward_plateau,
         "std_not_growing": std_slope <= STD_SLOPE_TOL and std_now < STD_MAX,
-        "discriminator_balanced": (abs(d_expert_mean) <= DISC_ABS_MAX
-                                   and abs(d_policy_mean) <= DISC_ABS_MAX
-                                   and amp_loss_mean > AMP_LOSS_MIN),
+        "discriminator_not_saturated": (abs(d_expert_mean) <= DISC_ABS_MAX
+                                        and abs(d_policy_mean) <= DISC_ABS_MAX
+                                        and amp_loss_mean > AMP_LOSS_MIN),
+        "discriminator_informative": (d_expert_mean >= DISC_EXPERT_MIN
+                                      and (d_expert_mean - d_policy_mean) >= DISC_SEPARATION_MIN),
         "value_loss_stable": value_plateau,
     }
     enough_training = new_iterations >= MIN_ITERATIONS
@@ -150,6 +181,8 @@ def evaluate(run_dir: Path) -> dict:
             "d_policy": round(d_policy_mean, 3),
             "amp_loss": round(amp_loss_mean, 4),
             "value_loss": round(float(value_loss[-BLOCK:].mean()), 5),
+            "timeout_share": round(timeout_share, 3),
+            **posture_means,
         },
         "checks": checks,
         "divergence_reasons": diverged,
@@ -181,6 +214,14 @@ def main() -> None:
         print(f"  imitation   : {metrics['imitation_fraction_of_ceiling']:.1%} of ceiling")
         print(f"  noise_std   : {metrics['noise_std']:.3f} "
               f"(slope {metrics['noise_std_slope_per_100']:+.4f}/100it)")
+        share = metrics['timeout_share']
+        ended_by = "not logged" if share < 0 else f"{share:.0%} time limit, {1 - share:.0%} fall"
+        print(f"  ended by    : {ended_by}")
+        if metrics["base_height"] >= 0.0:
+            print(f"  posture     : height {metrics['base_height']:.3f} m  "
+                  f"pitch {metrics['gravity_x']:+.3f}  roll {metrics['gravity_y']:+.3f}  "
+                  f"feet down {metrics['foot_contacts']:.2f}/4  "
+                  f"stance {metrics['stance_width']:.3f} m")
         print(f"  disc        : d_expert {metrics['d_expert']:+.3f}  "
               f"d_policy {metrics['d_policy']:+.3f}  AMP loss {metrics['amp_loss']:.4f}")
         for name, passed in report["checks"].items():

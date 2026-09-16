@@ -67,6 +67,7 @@ class SECAMPLoader(AMPLoader):
             skill_map=None,
             turn_mix_ratio=0.1,
             jump_turn_mix_ratio=0.0,
+            balance_skills=True,
             ):
         self.device = device
         self.time_between_frames = time_between_frames
@@ -85,6 +86,20 @@ class SECAMPLoader(AMPLoader):
             self._skill_name_to_id = _SKILL_MAP_5
         self._skill_ids = set(self._skill_name_to_id.values())
 
+        # The preload draw is weighted by MotionWeight across every clip at once, so with an
+        # unbalanced corpus the preload buffer inherits the corpus imbalance directly.  DogML
+        # is 1044 pace / 106 trot / 64 canter clips, so of a 2,000,000-transition buffer canter
+        # receives about 105,000 samples and pace about 1,720,000.  sample() then draws
+        # canter's expert minibatches, with replacement, from that much smaller pool for the
+        # whole run, so the discriminator sees far fewer distinct canter frames than pace ones
+        # and can memorise them -- and a memorised expert set is exactly the condition under
+        # which d_expert saturates and the reward gradient for that skill goes flat.
+        #
+        # Balancing here rather than in sample() is deliberate: sample() is already
+        # skill-matched and already balanced (skill commands are drawn uniformly), so the
+        # imbalance is entirely in how many distinct frames each skill's pool holds.  That is
+        # fixed at preload time or not at all.
+        self.balance_skills = balance_skills
         self.turn_mix_ratio = turn_mix_ratio
         # Per-skill override: jump gets its own ratio (default 0.0 = no mixing)
         self._per_skill_mix_ratio = {sid: turn_mix_ratio for sid in self._skill_ids}
@@ -164,10 +179,51 @@ class SECAMPLoader(AMPLoader):
             print(f"Loaded {traj_len:.2f}s motion from {motion_file}  (skill: {skill_tag})")
 
         self.trajectory_weights = np.array(self.trajectory_weights) / np.sum(self.trajectory_weights)
+        self.traj_idx_to_skill_id = np.array(self.traj_idx_to_skill_id, dtype=np.int32)
+        if self.balance_skills:
+            self.trajectory_weights = self._balance_skill_weights(self.trajectory_weights)
         self.trajectory_frame_durations = np.array(self.trajectory_frame_durations)
         self.trajectory_lens = np.array(self.trajectory_lens)
         self.trajectory_num_frames = np.array(self.trajectory_num_frames)
-        self.traj_idx_to_skill_id = np.array(self.traj_idx_to_skill_id, dtype=np.int32)
+
+    def _balance_skill_weights(self, weights: np.ndarray) -> np.ndarray:
+        """Rescale per-clip weights so every skill draws an equal share of the preload buffer.
+
+        Relative MotionWeight *within* a skill is preserved -- only the mass of each skill as a
+        whole is equalised, so a deliberately up-weighted clip keeps its advantage over its
+        siblings.  Unlabelled ("turn") clips are treated as one more class and given exactly
+        the share that sample() will actually consume, which is the largest per-skill turn mix
+        ratio; giving them an equal share instead would spend most of the buffer on motions
+        that are drawn 10% of the time.  A skill with no clips is skipped rather than given
+        mass, and sample() keeps its existing empty-pool fallback for that case.
+        """
+        weights = np.asarray(weights, dtype=np.float64).copy()
+        skill_ids = self.traj_idx_to_skill_id
+        present = [sid for sid in sorted(self._skill_ids) if np.any(skill_ids == sid)]
+        if not present:
+            return weights / weights.sum()
+
+        has_turn = bool(np.any(skill_ids == -1))
+        turn_share = max(self._per_skill_mix_ratio.values(), default=0.0) if has_turn else 0.0
+        turn_share = float(np.clip(turn_share, 0.0, 0.5))
+        per_skill_share = (1.0 - turn_share) / len(present)
+
+        balanced = np.zeros_like(weights)
+        for sid, share in [(sid, per_skill_share) for sid in present] + \
+                          ([(-1, turn_share)] if turn_share > 0.0 else []):
+            mask = skill_ids == sid
+            mass = weights[mask].sum()
+            if mass <= 0.0:
+                # Every clip in this class carries zero MotionWeight; fall back to uniform
+                # within the class so the class still receives its share.
+                balanced[mask] = share / max(int(mask.sum()), 1)
+            else:
+                balanced[mask] = weights[mask] * (share / mass)
+
+        total = balanced.sum()
+        if total <= 0.0:
+            return weights / weights.sum()
+        return balanced / total
 
     # ------------------------------------------------------------------
     # Preloading
@@ -208,6 +264,12 @@ class SECAMPLoader(AMPLoader):
                 skill_name = id_to_name.get(sid, f'id{sid}')
                 print(f'  skill {sid:2d} ({skill_name:>6}): {len(idxs):>8} samples')
             print(f'  turn motions         : {len(self.preload_turn_idx):>8} samples')
+            if self.balance_skills:
+                clip_counts = {sid: int(np.sum(self.traj_idx_to_skill_id == sid))
+                               for sid in self.preload_idx_by_skill}
+                print(f'  skill balancing ON: clips per skill {clip_counts} were equalised to '
+                      f'roughly equal preload shares (turn share '
+                      f'{max(self._per_skill_mix_ratio.values(), default=0.0):.2f})')
 
         self.all_trajectories_full = torch.vstack(self.trajectories_full)
 

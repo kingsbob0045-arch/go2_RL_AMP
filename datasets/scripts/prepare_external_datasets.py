@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import hashlib
 import io
 import json
@@ -14,6 +15,9 @@ import zipfile
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gait_phase import screen_clip  # noqa: E402
 
 DATASETS_ROOT = Path(__file__).resolve().parents[1]
 RAW_ROOT = DATASETS_ROOT / "external_raw"
@@ -26,11 +30,16 @@ MOCAP_GAIT_FILES = (
     "trot0.txt", "trot1.txt", "trot2.txt",
     "canter0.txt", "canter1.txt", "canter2.txt",
 )
-KINE2GO_GAIT_CLIPS = (
+KINE2GO_DOG_CLIPS = (
     "ai4_dog_canter",
     "ai4_dog_pace",
     "ai4_dog_trot_00",
     "ai4_dog_trot_01",
+)
+# Horse clips from the same release, deliberately excluded: a horse's limb proportions and
+# stride timing are not a dog's, and the three SECAMP skills are meant to be dog gaits.
+# Kept here so the exclusion is visible rather than implied by an absence.
+KINE2GO_HORSE_CLIPS = (
     "vhdc_horse1_s1_trot_01",
     "vhdc_horse1_s1_trot_02",
     "vhdc_horse1_s1_trot_03",
@@ -38,6 +47,7 @@ KINE2GO_GAIT_CLIPS = (
     "vhdc_horse1_s2_trot_02",
     "vhdc_horse1_s2_trot_03",
 )
+KINE2GO_GAIT_CLIPS = KINE2GO_DOG_CLIPS
 KINE2GO_FPS_OVERRIDES = {
     "vhdc_horse1_s2_trot_01": 120.0,
     "vhdc_horse1_s2_trot_02": 120.0,
@@ -55,6 +65,29 @@ DOGML_CHAIN_ORDER_FL_FR_RL_RR = (4, 0, 12, 8)
 DOGML_MIN_DISTANCE = 0.25
 DOGML_MIN_MOVING_FRACTION = 0.60
 
+# Footfall-phase screening of the DogML label (datasets/scripts/gait_phase.py).  The source
+# label is one free-text word describing a whole video, so it does not survive being cut into
+# clips intact.  Screening rejects; it never relabels, because three earlier classifier
+# variants disagreed with each other about exactly the trot/walk boundary most of these clips
+# sit on.  A clip is only dropped when another skill fits its measured phase better than its
+# own by more than DOGML_PHASE_MARGIN, or when the stride is too weak for the label to be
+# checked at all.  0.15 of the 0-1 score is roughly 0.075 cycles of mean footfall error per
+# leg: far beyond what measurement noise produces on a real gait, so an accepted clip that is
+# genuinely mislabelled has to be mislabelled subtly.
+#
+# Both thresholds were chosen from the measured distribution over all 1214 clips rather than
+# picked a priori (datasets/converted/dogml_phase_screen.json holds the raw measurements):
+#   * margin 0.20 rejects 37 clips, the tail of a distribution whose median clip fits its own
+#     label 0.23 better than any other.  29 of the 37 are DogML "trot" clips that measure as
+#     clean lateral-sequence walks -- e.g. phase [0.00, 0.38, 0.24, 0.75] at periodicity 0.73,
+#     which is a walk by any reading.  They come from a handful of source videos, so the
+#     annotator labelled the whole video and the walking segments inherited it.
+#   * periodicity 0.15 rejects the bottom 14% of measurable clips, whose foot-height motion is
+#     not dominated by any single stride: turns, gait transitions and stumbles.  Their phase
+#     is not trustworthy enough to screen on, and they are not clean gait exemplars either.
+DOGML_PHASE_MARGIN = 0.20
+DOGML_MIN_PERIODICITY = 0.15
+
 GO2_HIP_OFFSETS = np.asarray((
     (0.214512, 0.0465, -0.005366),
     (0.214512, -0.0465, -0.005366),
@@ -63,11 +96,49 @@ GO2_HIP_OFFSETS = np.asarray((
 ))
 GO2_HIP_LINK_LENGTH = 0.0955
 GO2_LEG_LINK_LENGTH = 0.213
-GO2_JOINT_LOWER = np.tile((-0.863, -0.686, -2.818), 4)
-GO2_JOINT_UPPER = np.tile((0.863, 4.501, -0.888), 4)
+# Official Go2 joint limits, in Isaac leg order FL, FR, RL, RR.  Front and rear thighs
+# differ, which a uniform tile cannot express -- the values these replaced were uniform and
+# matched no joint of the Go2 at all.  They were also narrower, so _go2_inverse_kinematics
+# was clipping retargeted poses the robot can actually reach: the thigh was held at
+# -0.686 rad where the Go2 reaches -1.5708, cutting most of the forward swing range.
+# Cross-checked against go2_Deploy/resources/go2/go2.xml, which carries the same numbers.
+GO2_JOINT_LOWER = np.array(
+    [-1.0472, -1.5708, -2.7227] * 2 + [-1.0472, -0.5236, -2.7227] * 2, dtype=np.float64
+)
+GO2_JOINT_UPPER = np.array(
+    [1.0472, 3.4907, -0.83776] * 2 + [1.0472, 4.5379, -0.83776] * 2, dtype=np.float64
+)
 
-LEG_REORDER_FR_FL_RR_RL = (1, 0, 3, 2)
-FOOT_REORDER_FL_RL_FR_RR = (0, 2, 1, 3)
+# Source layouts, established by brute-forcing every (block layout x 24 leg permutations x
+# abduction sign) combination against Go2 forward kinematics and keeping the one whose feet
+# agree with its own joint angles.  The winner is decisive in every case -- it lands at the
+# 0.022 m residual of the analytic FK model itself, while the runner-up is 2-10x worse.
+# tools/dataset_layout_check.py re-runs the search; validate_motion() enforces the result.
+#
+# Isaac target order is FL, FR, RL, RR.
+LEG_REORDER_FR_FL_RR_RL = (1, 0, 3, 2)   # source FR,FL,RR,RL -> Isaac
+LEG_REORDER_FL_RL_FR_RR = (0, 2, 1, 3)   # source FL,RL,FR,RR -> Isaac
+LEG_REORDER_IDENTITY = (0, 1, 2, 3)      # source already FL,FR,RL,RR
+
+# Kine2Go stores joints joint-major -- [4 abduction][4 thigh][4 calf] -- not leg-major.
+# Reading it as leg-major scrambles every joint: it put the FK residual at 0.28 m and drove
+# 100% of frames outside the Go2 joint limits.  The column means read joint-major are
+# abduction ~0, thigh 0.70/0.73 front and 0.94/1.03 rear, calf ~-1.5, i.e. the Go2 stance.
+KINE2GO_JOINTS_ARE_JOINT_MAJOR = True
+KINE2GO_JOINT_LEGS = LEG_REORDER_IDENTITY
+KINE2GO_FOOT_LEGS = LEG_REORDER_FL_RL_FR_RR
+
+# NJU stores joints leg-major and already in Isaac order, but its feet are in the PyBullet
+# FR,FL,RR,RL order -- confirmed independently by the sign of each foot's mean x and y.
+# The previous code applied the foot permutation to the joints as well and additionally
+# negated every abduction angle; both were wrong and together cost 0.163 m of FK residual.
+NJU_JOINT_LEGS = LEG_REORDER_IDENTITY
+NJU_FOOT_LEGS = LEG_REORDER_FR_FL_RR_RL
+
+# Acceptance gate for a converted clip.  The analytic FK used by go2_env.py differs from the
+# true Go2 kinematics by ~0.022 m on its own, so anything past 0.05 m is a layout bug, not
+# model error.
+MAX_FK_RESIDUAL = 0.05
 
 
 def _download(url: str, destination: Path) -> None:
@@ -144,7 +215,18 @@ def download_dogml() -> None:
 
 
 def _reorder_legs(values: np.ndarray, order: tuple[int, ...]) -> np.ndarray:
+    """Reorder a leg-major block: [leg0 xyz | leg1 xyz | ...] -> the requested leg order."""
     return values.reshape(len(values), 4, 3)[:, order, :].reshape(len(values), 12)
+
+
+def _joint_major_to_leg_major(values: np.ndarray, order: tuple[int, ...]) -> np.ndarray:
+    """Transpose a joint-major block into the leg-major layout the AMP format expects.
+
+    Input  [abduction x4 | thigh x4 | calf x4]
+    Output [leg0 (abduction, thigh, calf) | leg1 ... ] in the requested leg order.
+    """
+    per_joint = values.reshape(len(values), 3, 4)[:, :, order]
+    return np.transpose(per_joint, (0, 2, 1)).reshape(len(values), 12)
 
 
 def _quat_rotate_inverse_xyzw(quaternion: np.ndarray, vector: np.ndarray) -> np.ndarray:
@@ -224,9 +306,9 @@ def convert_kine2go() -> list[Path]:
 
         root_pos = source[:, 48:51]
         root_quat = _quat_wxyz_to_xyzw(source[:, 51:55])
-        joint_pos = _reorder_legs(source[:, 6:18], LEG_REORDER_FR_FL_RR_RL)
-        joint_vel = _reorder_legs(source[:, 24:36], LEG_REORDER_FR_FL_RR_RL)
-        foot_world = _reorder_legs(source[:, 36:48], FOOT_REORDER_FL_RL_FR_RR)
+        joint_pos = _joint_major_to_leg_major(source[:, 6:18], KINE2GO_JOINT_LEGS)
+        joint_vel = _joint_major_to_leg_major(source[:, 24:36], KINE2GO_JOINT_LEGS)
+        foot_world = _reorder_legs(source[:, 36:48], KINE2GO_FOOT_LEGS)
         foot_local = _quat_rotate_inverse_xyzw(
             np.repeat(root_quat, 4, axis=0),
             (foot_world.reshape(-1, 3) - np.repeat(root_pos, 4, axis=0)),
@@ -264,13 +346,13 @@ def convert_nju() -> list[Path]:
 
         root_pos = source[:, 0:3].copy()
         root_quat = source[:, 3:7]
-        joint_pos = _reorder_legs(source[:, 7:19], LEG_REORDER_FR_FL_RR_RL)
-        joint_vel = _reorder_legs(source[:, 37:49], LEG_REORDER_FR_FL_RR_RL)
-        foot_world = _reorder_legs(source[:, 19:31], LEG_REORDER_FR_FL_RR_RL)
+        # Joints are already in Isaac order; only the feet carry the PyBullet leg order.
+        # The abduction angles are in Isaac's sign convention too -- negating them, as this
+        # converter used to, is what put the feet 0.16 m away from where the joints place them.
+        joint_pos = _reorder_legs(source[:, 7:19], NJU_JOINT_LEGS)
+        joint_vel = _reorder_legs(source[:, 37:49], NJU_JOINT_LEGS)
+        foot_world = _reorder_legs(source[:, 19:31], NJU_FOOT_LEGS)
 
-        # NJU's PyBullet abduction convention is opposite Isaac's for all hips.
-        joint_pos[:, (0, 3, 6, 9)] *= -1.0
-        joint_vel[:, (0, 3, 6, 9)] *= -1.0
         foot_height = foot_world[:, 2::3]
         ground_offset = float(np.min(foot_height))
         foot_height -= ground_offset
@@ -403,7 +485,7 @@ def _convert_dogml_motion(source: np.ndarray) -> tuple[np.ndarray, float]:
     return frames, float(np.max(error))
 
 
-def convert_dogml() -> list[Path]:
+def convert_dogml(*, enforce_phase_screen: bool = True) -> list[Path]:
     archive = RAW_ROOT / "dogml" / "dataset.zip"
     output_root = OUTPUT_ROOT / "dogml_gaits"
     if output_root.exists():
@@ -419,7 +501,12 @@ def convert_dogml() -> list[Path]:
         "duplicate": 0,
         "conflicting_label": 0,
         "stationary": 0,
+        "reject_mislabelled": 0,
+        "reject_aperiodic": 0,
     }
+    # Kept, but with an unverifiable label -- counted separately so the number is visible.
+    unverified_count = 0
+    screen_records: list[dict[str, object]] = []
     with zipfile.ZipFile(archive) as dataset:
         text_paths = sorted(
             path for path in dataset.namelist()
@@ -469,6 +556,17 @@ def convert_dogml() -> list[Path]:
                     f"{motion_path}: Go2 retargeting error {max_retarget_error:.4f} m "
                     "exceeds 0.075 m"
                 )
+            screen = screen_clip(
+                frames, DOGML_FRAME_DURATION, skill,
+                margin=DOGML_PHASE_MARGIN, min_periodicity=DOGML_MIN_PERIODICITY)
+            screen_records.append({"stem": stem, "label": label, **screen})
+            if screen["verdict"] == "accept_unverified":
+                unverified_count += 1
+            elif screen["verdict"] != "accept":
+                excluded_counts[screen["verdict"]] += 1
+                if enforce_phase_screen:
+                    continue
+
             destination = output_root / f"{skill}_{stem}.json"
             _write_motion(destination, frames, DOGML_FRAME_DURATION)
             output_paths.append(destination)
@@ -483,6 +581,11 @@ def convert_dogml() -> list[Path]:
                 "distance": distance,
                 "moving_fraction": moving_fraction,
                 "max_retarget_error_m": max_retarget_error,
+                "stride_hz": screen["stride_hz"],
+                "phase": screen["phase"],
+                "periodicity": screen["periodicity"],
+                "phase_scores": screen["scores"],
+                "phase_verdict": screen["verdict"],
             })
 
     manifest_path = OUTPUT_ROOT / "dogml_gaits_manifest.json"
@@ -493,13 +596,26 @@ def convert_dogml() -> list[Path]:
             "minimum_moving_fraction": DOGML_MIN_MOVING_FRACTION,
             "excluded_labels": "all mixed labels and all labels other than walk/trot/run",
             "label_conflicts": "reject every copy when one motion digest has multiple gait labels",
+            "phase_screen": {
+                "enforced": enforce_phase_screen,
+                "margin": DOGML_PHASE_MARGIN,
+                "min_periodicity": DOGML_MIN_PERIODICITY,
+                "note": "rejects only; never relabels -- see datasets/scripts/gait_phase.py",
+                "kept_unverified": unverified_count,
+            },
         },
         "skill_counts": skill_counts,
         "excluded_counts": excluded_counts,
         "motions": manifest,
     }, indent=2))
+    screen_path = OUTPUT_ROOT / "dogml_phase_screen.json"
+    screen_path.write_text(json.dumps(screen_records, indent=2))
     print(f"DogML skill coverage: {skill_counts}; exclusions: {excluded_counts}")
+    print(f"DogML clips kept with an unverifiable label (shorter than one stride): "
+          f"{unverified_count}")
     print(f"DogML selection manifest: {manifest_path}")
+    print(f"DogML phase screening record: {screen_path} "
+          f"({'enforced' if enforce_phase_screen else 'REPORT ONLY'})")
     return output_paths
 
 
@@ -516,11 +632,40 @@ def validate_motion(path: Path) -> dict[str, object]:
     norms = np.linalg.norm(frames[:, 3:7], axis=1)
     if float(np.max(np.abs(norms - 1.0))) > 1.0e-3:
         raise ValueError(f"{path}: quaternion norm error exceeds 1e-3")
+
+    # Kinematic gate.  The AMP discriminator is fed joint angles alongside foot positions,
+    # but on the policy side the feet are computed from the joints, so the two are identical
+    # by construction.  A reference clip where they disagree hands the discriminator a
+    # feature no policy can ever reproduce, and imitation silently degenerates.  Both the
+    # Kine2Go joint-major bug and the NJU abduction flip were invisible for a full training
+    # sweep; this check turns either of them into an immediate, named failure.
+    joint_pos = frames[:, 7:19]
+    stored_feet = frames[:, 19:31].reshape(len(frames), 4, 3)
+    residual = np.linalg.norm(
+        _go2_forward_kinematics(joint_pos).reshape(len(frames), 4, 3) - stored_feet, axis=2
+    )
+    fk_residual = float(residual.mean())
+    if fk_residual > MAX_FK_RESIDUAL:
+        raise ValueError(
+            f"{path}: foot positions disagree with joint angles by {fk_residual:.3f} m "
+            f"(limit {MAX_FK_RESIDUAL} m). The source block layout is being misread.")
+
+    below = np.maximum(GO2_JOINT_LOWER - joint_pos, 0.0)
+    above = np.maximum(joint_pos - GO2_JOINT_UPPER, 0.0)
+    violation = float(np.max(below + above))
+    if violation > 1.0e-6:
+        worst = int(np.argmax((below + above).max(axis=0)))
+        raise ValueError(
+            f"{path}: joint {worst} exceeds the Go2 limit by {violation:.3f} rad. "
+            f"The Go2 cannot reach this pose, so it cannot imitate it.")
+
     return {
         "dataset": path.parent.name,
         "file": path.name,
         "frames": len(frames),
         "fps": 1.0 / frame_duration,
+        "fk_residual_m": round(fk_residual, 5),
+        "max_joint_limit_violation_rad": round(violation, 6),
         "sha256": _sha256_file(path),
     }
 
@@ -534,6 +679,11 @@ def main() -> None:
     parser.add_argument(
         "--no-download", action="store_true",
         help="Convert existing files without downloading missing raw files.",
+    )
+    parser.add_argument(
+        "--no-phase-screen", action="store_true",
+        help="Measure DogML footfall phase and record it, but keep every clip.  Use this to "
+             "inspect the score distribution before choosing rejection thresholds.",
     )
     args = parser.parse_args()
 
@@ -560,7 +710,7 @@ def main() -> None:
             download_dogml()
         archive = RAW_ROOT / "dogml" / "dataset.zip"
         _verify_raw_files([archive])
-        output_paths.extend(convert_dogml())
+        output_paths.extend(convert_dogml(enforce_phase_screen=not args.no_phase_screen))
 
     provenance_paths = []
     for dataset_name in ("mocap_gaits", "kine2go_gaits", "nju_agility", "dogml_gaits"):

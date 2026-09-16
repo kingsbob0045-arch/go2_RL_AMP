@@ -34,6 +34,10 @@ class SECAMPPPO:
                  amp_replay_buffer_size=100_000,
                  min_std=None,
                  max_std=None,
+                 disc_target_expert=None,
+                 disc_lr_bounds=(1.0e-5, 3.0e-3),
+                 disc_update_ratio_min=0.2,
+                 disc_adapt_gain=1.15,
                  ):
 
         self.device = device
@@ -43,6 +47,25 @@ class SECAMPPPO:
         self.disc_learning_rate = disc_learning_rate if disc_learning_rate is not None else learning_rate
         self.min_std = min_std
         self.max_std = max_std
+
+        # ---- Discriminator balance controller ----------------------------
+        # The AMP reward is coef * clamp(1 - (d-1)^2/4, 0) * dt, maximal at d = +1.  A
+        # discriminator that collapses towards d = 0 for everything therefore hands the policy
+        # 75% of the maximum imitation reward for free, while carrying no information about
+        # whether the motion actually resembles the expert.  That is the failure this run
+        # keeps hitting: d_expert drifting down from 0.77 to 0.63 while imi_reward rises.
+        #
+        # A fixed disc_learning_rate cannot prevent it, because the right learning rate
+        # depends on how fast the policy is currently moving.  So d_expert is treated as the
+        # controlled variable: when it falls below the band the discriminator is losing and is
+        # given more learning rate and more update steps; when it rises above the band the
+        # discriminator is winning so hard that its gradient to the policy vanishes, and both
+        # are pulled back.  Set disc_target_expert=None to restore the fixed-rate behaviour.
+        self.disc_target_expert = tuple(disc_target_expert) if disc_target_expert else None
+        self.disc_lr_bounds = tuple(disc_lr_bounds)
+        self.disc_update_ratio_min = float(disc_update_ratio_min)
+        self.disc_adapt_gain = float(disc_adapt_gain)
+        self.disc_update_ratio = 1.0
 
         # Discriminator
         self.discriminator = discriminator
@@ -157,6 +180,41 @@ class SECAMPPPO:
 
     # ------------------------------------------------------------------
 
+    def _adapt_discriminator(self, mean_expert_pred: float) -> None:
+        """Hold d_expert inside the target band by moving the discriminator's own budget.
+
+        d_expert is the discriminator's LSGAN score on real expert motion, whose target is
+        +1.  Read as a health metric it says how much of the expert/policy gap the
+        discriminator can still resolve:
+
+          * below the band, the discriminator has been out-run by the policy.  Its output
+            collapses towards 0, where the AMP reward is 0.75 of maximum for *any* motion, so
+            imitation reward rises while imitation quality does not.  Fix: train it harder.
+          * above the band, the discriminator separates the two distributions so cleanly that
+            the policy's reward gradient flattens out -- the mirror image of the torque
+            saturation problem, in reward space instead of actuator space.  Fix: hold it back.
+
+        Both knobs move together because they act on the same quantity (gradient steps per
+        policy update) at different granularities, and one alone saturates: the learning rate
+        hits its bound while the imbalance persists.
+        """
+        if self.disc_target_expert is None:
+            return
+        low, high = self.disc_target_expert
+        gain = self.disc_adapt_gain
+        lr_min, lr_max = self.disc_lr_bounds
+        if mean_expert_pred < low:
+            self.disc_learning_rate = min(lr_max, self.disc_learning_rate * gain)
+            self.disc_update_ratio = min(1.0, self.disc_update_ratio * gain)
+        elif mean_expert_pred > high:
+            self.disc_learning_rate = max(lr_min, self.disc_learning_rate / gain)
+            self.disc_update_ratio = max(self.disc_update_ratio_min,
+                                         self.disc_update_ratio / gain)
+        else:
+            return
+        for group in self.disc_optimizer.param_groups:
+            group['lr'] = self.disc_learning_rate
+
     def update(self):
         mean_value_loss     = 0
         mean_surrogate_loss = 0
@@ -164,6 +222,10 @@ class SECAMPPPO:
         mean_grad_pen_loss  = 0
         mean_policy_pred    = 0
         mean_expert_pred    = 0
+        disc_steps          = 0
+        # Fractional-step accumulator: a ratio of 0.4 takes a discriminator step on 2 of
+        # every 5 minibatches, spread evenly, rather than on a random subset.
+        disc_budget         = 0.0
 
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(
@@ -252,8 +314,18 @@ class SECAMPPPO:
             expert_loss  = nn.MSELoss()(expert_d, torch.ones_like(expert_d))
             policy_loss  = nn.MSELoss()(policy_d, -torch.ones_like(policy_d))
             amp_loss     = 0.5 * (expert_loss + policy_loss)
-            grad_pen_loss = self.discriminator.compute_grad_pen(
-                exp_flat, exp_skill, lambda_=10)
+
+            # Whether this minibatch trains the discriminator.  The forward passes above are
+            # always run, so d_expert/d_policy stay measured over the whole iteration even
+            # when the controller has throttled the updates.  The gradient penalty is a
+            # double backward and is by far the most expensive part, so it is only paid for
+            # on minibatches that actually take a step.
+            disc_budget += self.disc_update_ratio
+            take_disc_step = disc_budget >= 1.0
+            if take_disc_step:
+                disc_budget -= 1.0
+                grad_pen_loss = self.discriminator.compute_grad_pen(
+                    exp_flat, exp_skill, lambda_=10)
 
             # ---- Policy gradient step ----------------------------------
             policy_loss_total = (surrogate_loss
@@ -265,10 +337,13 @@ class SECAMPPPO:
             self.optimizer.step()
 
             # ---- Discriminator gradient step ---------------------------
-            disc_loss = amp_loss + grad_pen_loss
-            self.disc_optimizer.zero_grad()
-            disc_loss.backward()
-            self.disc_optimizer.step()
+            if take_disc_step:
+                disc_loss = amp_loss + grad_pen_loss
+                self.disc_optimizer.zero_grad()
+                disc_loss.backward()
+                self.disc_optimizer.step()
+                mean_grad_pen_loss += grad_pen_loss.item()
+                disc_steps += 1
 
             if not self.actor_critic.fixed_std and self.min_std is not None:
                 self.actor_critic.std.data = self.actor_critic.std.data.clamp(min=self.min_std)
@@ -287,16 +362,16 @@ class SECAMPPPO:
             mean_value_loss     += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_amp_loss       += amp_loss.item()
-            mean_grad_pen_loss  += grad_pen_loss.item()
             mean_policy_pred    += policy_d.mean().item()
             mean_expert_pred    += expert_d.mean().item()
 
         mean_value_loss     /= num_updates
         mean_surrogate_loss /= num_updates
         mean_amp_loss       /= num_updates
-        mean_grad_pen_loss  /= num_updates
+        mean_grad_pen_loss  /= max(disc_steps, 1)
         mean_policy_pred    /= num_updates
         mean_expert_pred    /= num_updates
+        self._adapt_discriminator(mean_expert_pred)
         self.storage.clear()
 
         return (mean_value_loss, mean_surrogate_loss, mean_amp_loss,

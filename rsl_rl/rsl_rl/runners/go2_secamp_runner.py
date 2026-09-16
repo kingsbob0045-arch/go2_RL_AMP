@@ -68,6 +68,7 @@ class Go2SECAMPRunner:
             num_amp_obs=self.amp_num_obs,
             amp_horizon=self.amp_horizon,
             skill_cmd_dim=self.skill_cmd_dim,
+            balance_skills=self.cfg.get("amp_balance_skills", True),
         )
 
         amp_normalizer = Normalizer(self.amp_num_obs * self.amp_horizon)
@@ -336,6 +337,10 @@ class Go2SECAMPRunner:
             self.writer.add_scalar('Train/mean_imi_reward',     statistics.mean(locs['imi_rewbuffer']),  locs['it'])
             self.writer.add_scalar('Disc/d_expert',             locs['mean_expert_pred'],                locs['it'])
             self.writer.add_scalar('Disc/d_policy',             locs['mean_policy_pred'],                locs['it'])
+            self.writer.add_scalar('Disc/separation',
+                                   locs['mean_expert_pred'] - locs['mean_policy_pred'],       locs['it'])
+        self.writer.add_scalar('Disc/learning_rate',   self.alg.disc_learning_rate, locs['it'])
+        self.writer.add_scalar('Disc/update_ratio',    self.alg.disc_update_ratio,  locs['it'])
 
         header = (f" \033[1m Learning iteration "
                   f"{locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']}"
@@ -352,6 +357,7 @@ class Go2SECAMPRunner:
                 f"""{'AMP grad pen loss:':>{pad}} {locs['mean_grad_pen_loss']:.4f}\n"""
                 f"""{'AMP mean policy pred:':>{pad}} {locs['mean_policy_pred']:.4f}\n"""
                 f"""{'AMP mean expert pred:':>{pad}} {locs['mean_expert_pred']:.4f}\n"""
+                f"""{'Disc lr / update ratio:':>{pad}} {self.alg.disc_learning_rate:.2e} / {self.alg.disc_update_ratio:.2f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean task reward:':>{pad}} {statistics.mean(locs['task_rewbuffer']):.2f}\n"""
@@ -402,6 +408,8 @@ class Go2SECAMPRunner:
                     'Train/mean_imi_reward':     statistics.mean(locs['imi_rewbuffer']),
                     'Disc/d_expert':             locs['mean_expert_pred'],
                     'Disc/d_policy':             locs['mean_policy_pred'],
+                    'Disc/learning_rate':        self.alg.disc_learning_rate,
+                    'Disc/update_ratio':         self.alg.disc_update_ratio,
                 })
             if locs['ep_infos']:
                 for key in locs['ep_infos'][0]:
@@ -428,6 +436,8 @@ class Go2SECAMPRunner:
             'disc_optimizer_state_dict':  self.alg.disc_optimizer.state_dict(),
             'discriminator_state_dict':   self.alg.discriminator.state_dict(),
             'amp_normalizer':             self.alg.amp_normalizer,
+            'disc_learning_rate':         self.alg.disc_learning_rate,
+            'disc_update_ratio':          self.alg.disc_update_ratio,
             'iter':                       self.current_learning_iteration,
             'infos':                      infos,
         }, path)
@@ -466,6 +476,18 @@ class Go2SECAMPRunner:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
             if 'disc_optimizer_state_dict' in loaded_dict and not disc_type_switched:
                 self.alg.disc_optimizer.load_state_dict(loaded_dict['disc_optimizer_state_dict'])
+        # The discriminator balance controller owns disc_learning_rate, so a resumed run has to
+        # pick up where the controller left off rather than restarting from the config value --
+        # otherwise every resume re-runs the slow adaptation from scratch.  Loading the
+        # optimiser state already restores the rate inside the param groups; this keeps the
+        # algorithm's own copy, which is what the controller reads and writes, consistent.
+        if 'disc_learning_rate' in loaded_dict:
+            self.alg.disc_learning_rate = loaded_dict['disc_learning_rate']
+            self.alg.disc_update_ratio = loaded_dict.get('disc_update_ratio', 1.0)
+        elif load_optimizer and not disc_type_switched:
+            self.alg.disc_learning_rate = self.alg.disc_optimizer.param_groups[0]['lr']
+        for group in self.alg.disc_optimizer.param_groups:
+            group['lr'] = self.alg.disc_learning_rate
         self.current_learning_iteration = loaded_dict['iter']
         return loaded_dict['infos']
 

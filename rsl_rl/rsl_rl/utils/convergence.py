@@ -20,6 +20,22 @@ STD_MAX = 3.0
 # while the failure we are guarding against ran at 2.2/100it.
 STD_SLOPE_TOL = 0.01
 DISC_ABS_MAX = 0.80
+# A saturation ceiling alone lets the opposite failure through unnoticed: a discriminator
+# that has collapsed towards d = 0 for every input scores |d_expert| = 0.0 and passes.  That
+# is not convergence, it is the discriminator giving up -- and because the AMP reward is
+# coef * clamp(1 - (d-1)^2/4, 0) * dt, d = 0 still pays 75% of the maximum imitation reward
+# for any motion at all.  Runs have been read as improving on exactly this basis: imi_reward
+# rising from 9.8 to 12.9 while d_expert fell from 0.765 to 0.629 and Loss/AMP rose.  So the
+# band is two-sided, and the expert/policy separation is checked as well, because d_expert
+# can sit inside the band while the discriminator separates nothing.
+# Set just below the controller's band low edge (0.70), so the criterion reads as "the
+# discriminator balance controller is still holding its setpoint".  At a looser 0.60 the
+# dogml v3 run passed with d_expert 0.634 and was declared converged -- the exact run whose
+# d_expert had fallen from 0.765 to 0.629 while its imitation reward rose from 9.8 to 12.9.
+# Separation 1.0 is likewise well inside what a healthy run shows (v2 and v3 both ran at
+# 1.27-1.42) while still ruling out a collapse towards 0.
+DISC_EXPERT_MIN = 0.65
+DISC_SEPARATION_MIN = 1.00
 AMP_LOSS_MIN = 0.02
 VALUE_LOSS_TOL = 0.05
 TREND_WINDOW = 300
@@ -49,6 +65,7 @@ class ConvergenceMonitor:
                           "d_expert", "d_policy", "value_loss")}
         self._converged_streak = 0
         self.last_report = {}
+        self.last_values = {}
 
     def update(self, *, reward, episode_length, noise_std, amp_loss,
                d_expert, d_policy, value_loss):
@@ -75,13 +92,18 @@ class ConvergenceMonitor:
 
         reward_deltas = [abs(reward_blocks[i] - reward_blocks[i + 1]) / max(abs(reward_blocks[i + 1]), 1e-6)
                          for i in range(len(reward_blocks) - 1)]
+        self.last_values = {"d_expert": d_expert, "d_policy": d_policy, "amp_loss": amp_loss,
+                            "episode_length": episode_length, "noise_std": std_now}
         return {
             "episode_length_high": episode_length >= EPISODE_LENGTH_MIN,
             "episode_length_flat": abs(_slope_per_100(history["episode_length"])) < 0.005 * MAX_EPISODE_STEPS,
             "reward_plateau": len(reward_deltas) >= 2 and all(d < REWARD_PLATEAU_TOL for d in reward_deltas),
             "std_not_growing": _slope_per_100(history["noise_std"]) <= STD_SLOPE_TOL and std_now < STD_MAX,
-            "discriminator_balanced": (abs(d_expert) <= DISC_ABS_MAX and abs(d_policy) <= DISC_ABS_MAX
-                                       and amp_loss > AMP_LOSS_MIN),
+            "discriminator_not_saturated": (abs(d_expert) <= DISC_ABS_MAX
+                                            and abs(d_policy) <= DISC_ABS_MAX
+                                            and amp_loss > AMP_LOSS_MIN),
+            "discriminator_informative": (d_expert >= DISC_EXPERT_MIN
+                                          and (d_expert - d_policy) >= DISC_SEPARATION_MIN),
             "value_loss_stable": (len(value_blocks) >= 2 and
                                   abs(value_blocks[0] - value_blocks[1]) / max(abs(value_blocks[1]), 1e-6)
                                   < VALUE_LOSS_TOL),
@@ -102,7 +124,15 @@ class ConvergenceMonitor:
     def summary(self):
         if not self.last_report:
             return "convergence monitor: not enough data yet"
+        # The discriminator numbers are printed either way.  They are the criterion most often
+        # misread from the reward curves alone, so the report states them rather than only
+        # saying pass or fail.
+        values = self.last_values
+        disc = (f"d_expert {values['d_expert']:+.3f}, d_policy {values['d_policy']:+.3f}, "
+                f"separation {values['d_expert'] - values['d_policy']:.3f}, "
+                f"AMP loss {values['amp_loss']:.4f}") if values else ""
         failing = [name for name, passed in self.last_report.items() if not passed]
         if not failing:
-            return f"convergence monitor: all criteria met for {self._converged_streak} iterations"
-        return f"convergence monitor: still failing {', '.join(failing)}"
+            return (f"convergence monitor: all criteria met for {self._converged_streak} "
+                    f"iterations ({disc})")
+        return f"convergence monitor: still failing {', '.join(failing)} ({disc})"

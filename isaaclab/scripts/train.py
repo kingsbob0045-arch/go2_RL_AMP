@@ -10,10 +10,32 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--task", default="Isaac-Go2-AMP-Direct-v0")
 parser.add_argument("--num_envs", type=int, default=None)
-parser.add_argument("--max_iterations", type=int, default=None)
+parser.add_argument(
+    "--max_iterations", type=int, default=None,
+    help="Absolute iteration to stop at.  When resuming with --checkpoint this counts from "
+         "the checkpoint's own iteration, so it is a target rather than an extra amount.",
+)
 parser.add_argument("--checkpoint", type=str, default=None)
 parser.add_argument("--seed", type=int, default=None)
+parser.add_argument(
+    "--entropy_coef", type=float, default=None,
+    help="PPO entropy bonus weight.  The policy std is a raw parameter, so the entropy "
+         "gradient w.r.t. it is 1/std and Adam turns that into a near-constant increase of "
+         "roughly one learning rate per update.  Once the task reward saturates nothing "
+         "opposes it, so long runs need a smaller value than the 0.01 used for short ones.",
+)
 parser.add_argument("--amp_preload_transitions", type=int, default=None)
+parser.add_argument("--action_rate_scale", type=float, default=None)
+parser.add_argument(
+    "--disc_target_expert", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
+    help="Band the discriminator controller holds Disc/d_expert inside.  Pass the same value "
+         "twice to pin it, or use --no_disc_adapt to restore the fixed learning rate.",
+)
+parser.add_argument("--no_disc_adapt", action="store_true",
+                    help="Disable the adaptive discriminator controller.")
+parser.add_argument("--no_skill_balance", action="store_true",
+                    help="Weight the expert preload buffer by clip count instead of giving "
+                         "each skill an equal share.")
 parser.add_argument(
     "--amp_dataset",
     choices=("baseline", "mocap_gaits", "kine2go_gaits", "nju_agility", "dogml_gaits"),
@@ -21,6 +43,15 @@ parser.add_argument(
     help="SECAMP motion dataset. External datasets must be prepared first.",
 )
 parser.add_argument("--run_name", type=str, default=None, help="TensorBoard run label.")
+parser.add_argument(
+    "--stage", type=str, default=None, choices=("core", "latency", "dynamics", "terrain"),
+    help="Sim-to-real difficulty stage.  The config ships with every group enabled, so this "
+         "switches OFF everything above the named stage: 'core' is flat ground with no "
+         "latency and no extra randomisation, then latency adds control delay and wider PD "
+         "gains, dynamics adds per-link mass/COM, joint friction/armature and IMU bias, and "
+         "terrain adds the random grid.  Omit to run everything at once -- which is what "
+         "produced a 20-hour run that could not say which change broke it.",
+)
 parser.add_argument(
     "--early_stop",
     action="store_true",
@@ -68,6 +99,41 @@ AMP_DATASETS = {
 }
 
 
+STAGES = ("core", "latency", "dynamics", "terrain")
+
+
+def apply_stage(env_cfg, stage: str) -> None:
+    """Disable every difficulty group above `stage`.
+
+    Subtractive on purpose: the config carries the full sim-to-real setup, and a stage is a
+    prefix of it.  That keeps one source of truth for what "full difficulty" means, instead of
+    a second copy of every range living in here and drifting from it.
+    """
+    level = STAGES.index(stage)
+    events = env_cfg.events
+    if level < STAGES.index("terrain"):
+        # terrain_type="plane" makes TerrainImporter ignore the generator; go2_env's
+        # _setup_scene already special-cases it to set env_spacing.
+        env_cfg.terrain.terrain_type = "plane"
+        env_cfg.terrain.terrain_generator = None
+    if level < STAGES.index("dynamics"):
+        events.link_mass = None
+        events.link_com = None
+        events.joint_parameters = None
+        env_cfg.gravity_bias = 0.0
+    if level < STAGES.index("latency"):
+        env_cfg.action_latency_steps = (0, 0)
+        env_cfg.observation_latency_steps = (0, 0)
+        gains = events.actuator_gains.params
+        gains["stiffness_distribution_params"] = (0.9, 1.1)
+        gains["damping_distribution_params"] = (0.9, 1.1)
+    print(f"Difficulty stage '{stage}': "
+          f"terrain={env_cfg.terrain.terrain_type}, "
+          f"action_latency={env_cfg.action_latency_steps}, "
+          f"gravity_bias={env_cfg.gravity_bias}, "
+          f"link_mass={'on' if events.link_mass else 'off'}", flush=True)
+
+
 def main():
     if args.task not in TASKS:
         raise ValueError(f"Unknown task {args.task}; choose one of {tuple(TASKS)}")
@@ -92,8 +158,19 @@ def main():
         train_cfg["seed"] = args.seed
     if args.max_iterations is not None:
         train_cfg["runner"]["max_iterations"] = args.max_iterations
+    if args.entropy_coef is not None:
+        train_cfg["algorithm"]["entropy_coef"] = args.entropy_coef
     if args.amp_preload_transitions is not None and "amp_num_preload_transitions" in train_cfg["runner"]:
         train_cfg["runner"]["amp_num_preload_transitions"] = args.amp_preload_transitions
+    if args.action_rate_scale is not None:
+        env_cfg.action_rate_scale = args.action_rate_scale
+    if args.stage is not None:
+        apply_stage(env_cfg, args.stage)
+    if args.no_disc_adapt:
+        train_cfg["algorithm"]["disc_target_expert"] = None
+    elif args.disc_target_expert is not None:
+        train_cfg["algorithm"]["disc_target_expert"] = tuple(args.disc_target_expert)
+    train_cfg["runner"]["amp_balance_skills"] = not args.no_skill_balance
     random.seed(train_cfg["seed"])
     np.random.seed(train_cfg["seed"])
     torch.manual_seed(train_cfg["seed"])
@@ -117,7 +194,18 @@ def main():
         print(f"Early stopping enabled (minimum {args.early_stop_min_iterations} iterations)", flush=True)
     if args.checkpoint:
         runner.load(args.checkpoint)
-    runner.learn(train_cfg["runner"]["max_iterations"], init_at_random_ep_len=True)
+    # runner.learn() counts iterations relative to the checkpoint it resumed from, so pass
+    # the remaining amount to make --max_iterations the absolute stopping point.
+    total_iterations = train_cfg["runner"]["max_iterations"]
+    remaining = total_iterations - runner.current_learning_iteration
+    if remaining <= 0:
+        raise ValueError(
+            f"--max_iterations {total_iterations} is not beyond the resumed checkpoint's "
+            f"iteration {runner.current_learning_iteration}")
+    if runner.current_learning_iteration:
+        print(f"Resuming at iteration {runner.current_learning_iteration}; "
+              f"running {remaining} more to reach {total_iterations}", flush=True)
+    runner.learn(remaining, init_at_random_ep_len=True)
     env.close()
 
 
